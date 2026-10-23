@@ -19,7 +19,7 @@
 import { spawn } from 'node:child_process'
 import { appendFileSync, mkdirSync, readFileSync, readdirSync, rmSync, unlinkSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 
 /** 本插件包的根目录（本文件就在包根）。 */
 const PACKAGE_ROOT = import.meta.dirname
@@ -44,8 +44,8 @@ export const inject = ['tools']
 /** 面板/状态 API 路径（只给本插件自己的 Client 用）。 */
 const API_PATH = '/auto-restart/api'
 
-/** 外部重启脚本。可用插件 config.scriptPath 覆盖。 */
-const DEFAULT_SCRIPT = 'D:\\DeepSeek Harness\\dsh-tools\\Restart-DSH.ps1'
+/** 外部重启脚本。随包附带，默认取包内的 scripts/，可用 config.scriptPath 覆盖。 */
+const DEFAULT_SCRIPT = join(PACKAGE_ROOT, 'scripts', 'Restart-DSH.ps1')
 
 /** 脚本默认唤醒词。 */
 const DEFAULT_AUTOSAY = '已通过插件重启'
@@ -1147,7 +1147,7 @@ export function apply(ctx, config = {}) {
         last: { at: Date.now(), ok: false, reason: 'launch-watchdog' },
         message:
           '重启脚本已经拉起，但 90 秒内 DSH 一直没有退出 —— 这次重启没有发生。' +
-          '可以看一下 dsh-tools\\logs\\ 里最新的 restart-*.log。',
+          `可以看一下 ${join(dirname(scriptPath), 'logs')} 里最新的 restart-*.log。`,
       })
     }, LAUNCH_WATCHDOG_MS)
     if (typeof 看门狗.unref === 'function') 看门狗.unref()

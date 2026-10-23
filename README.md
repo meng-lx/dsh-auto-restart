@@ -5,16 +5,16 @@
 
 等**整个 DSH 都空闲下来**再安全地重启它，重启完成后自动回到原会话说一句话。
 
-插件只负责判断「什么时候可以动手」；杀进程、跑命令、重启、唤醒，交给外部的
-`Restart-DSH.ps1`。两边通过一个交接文件通信，谁也不猜对方的状态。
+插件只负责判断「什么时候可以动手」；杀进程、跑命令、重启、唤醒，交给包里的
+PowerShell 脚本。两边通过一个交接文件通信，谁也不猜对方的状态。
 
 ## 前置条件
 
 - DeepSeek Harness（桌面端或网页端）
 - Windows
-- 两个 PowerShell 脚本：`scripts/Restart-DSH.ps1` 与 `scripts/Start-DSH.ps1`（本仓库自带）。
-  把它们放在同一个目录，让插件设置页的「脚本路径」指向 `Restart-DSH.ps1` 即可。
-  默认值是 `D:\DeepSeek Harness\dsh-tools\Restart-DSH.ps1`，装到别处记得改。
+
+重启动作由包里的 PowerShell 脚本完成，不需要自己写。插件只在倒计时结束后调用它，
+设置页里能看到它当前解析到的路径。想换成自己的实现也只要接住同样的参数。
 
 ## 安装
 
@@ -115,6 +115,7 @@
 | `client.js` | Client 半边：`shell.overlay` 上的倒计时页与终止页，`settings.section` 里的设置页 |
 | `scripts/Restart-DSH.ps1` | 真正动手：关 DSH → 跑命令 → 启动 DSH → 补交接状态 |
 | `scripts/Start-DSH.ps1` | 被上一个脚本调用：按 desktop / web 启动，等就绪 |
+| `scripts/say.js` | 只在 `wakeMode: 'script'` 时用：CDP 往输入框注入 |
 | `test/idle-check.mjs` | 离线单测，`node test/idle-check.mjs`，不需要 DSH |
 | `cordis.patch.yml` | bundle patch，把本包插进 profile 的 cordis 树 |
 | `install.ps1` | 把插件装进 profile（`-Profile web\|desktop\|both`） |
@@ -174,6 +175,6 @@
 ## 已知限制
 
 - 网页端尚未实测（插件、脚本两侧都按网页端写好了，缺一次真机验证）；
-- 脚本路径默认写死为 `D:\DeepSeek Harness\dsh-tools\Restart-DSH.ps1`，
-  别人装之前得先有这两个脚本，或在设置页改路径；
+- 桌面端的启动路径依赖 `%LOCALAPPDATA%\Programs\DeepSeek Harness`，DSH 装在别处需要改
+  `scripts/Start-DSH.ps1`；
 - 桌面端重启后窗口位置、大小由 DSH 自己决定，插件不介入。

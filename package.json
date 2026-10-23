@@ -21,7 +21,8 @@
     "README.md",
     "install.ps1",
     "scripts/Restart-DSH.ps1",
-    "scripts/Start-DSH.ps1"
+    "scripts/Start-DSH.ps1",
+    "scripts/say.js"
   ],
   "dsh": {
     "bundle": {
