@@ -1319,18 +1319,9 @@ export function apply(ctx, config = {}) {
         `工具调用：command=${command ? JSON.stringify(command) : '（无，纯重启）'} autoSay=${JSON.stringify(autoSay)} 倒计时=${countdownSec}s 命令超时=${timeoutSec}s 会话=${sessionId}`,
       )
 
-      // 空闲判定不放这里，放倒计时结束那一刻（见下面）。
-      // 倒计时本来就是「给还在跑的东西收尾」的窗口：调用瞬间有人正在跑，
-      // 不代表倒计时结束时还在跑。调用时只把现状记下来，用于倒计时页展示。
-      const blockersAtStart = collectBlockers(services)
-      if (blockersAtStart.length > 0) {
-        logger.line(
-          `调用时仍有 ${blockersAtStart.length} 处在忙，先进倒计时、结束时再判：${blockersAtStart
-            .map((b) => `${b.kind}:${b.label}`)
-            .join(' / ')}`,
-        )
-      }
-
+      // 空闲判定只在倒计时结束那一刻做（见下面）。入口不判，也不预扫：
+      // 调用它的这个 agent 此刻必然是 running，扫出来的「忙」里永远有它自己，
+      // 除了在日志里写一句噪音，改变不了任何行为。
       cancelSource = ''
       // 先不起表：deadline 留 0，等页面把自己画出来（来读状态）那一刻再定。
       // 实际等待 = 设置值 + 999ms：多出来的不到 1 秒，页面上不会先蹦出一个「设置值+1」。
@@ -1346,7 +1337,7 @@ export function apply(ctx, config = {}) {
         command,
         autoSay,
         sessionId,
-        blockers: blockersAtStart,
+        blockers: [],
       })
       logger.line(`进入 ${countdownSec} 秒倒计时，等页面画出来再起表`)
 
