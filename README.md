@@ -9,9 +9,9 @@
 
 - DeepSeek Harness（桌面端或网页端）
 - Windows
-- 两个 PowerShell 脚本：`scripts/Restart-DSH.ps1`、`scripts/Start-DSH.ps1`。
-  仓库自带，把 `scripts/` 整个放到任意目录即可（默认找
-  `D:\DeepSeek Harness\dsh-tools\`，可用插件设置页的「脚本路径」改）
+- 两个 PowerShell 脚本：`scripts/Restart-DSH.ps1` 与 `scripts/Start-DSH.ps1`（本仓库自带）。
+  把它们放在同一个目录，让插件设置页的「脚本路径」指向 `Restart-DSH.ps1` 即可。
+  默认值是 `D:\DeepSeek Harness\dsh-tools\Restart-DSH.ps1`，装到别处记得改。
 
 ## 安装
 
