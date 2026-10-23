@@ -1,0 +1,15 @@
+# 依赖
+node_modules/
+
+# 开发期临时脚本与会话记录，不属于插件
+_probe/
+*.log
+*.zip
+
+# 内部规格与验证清单，不对外发布
+DESIGN.md
+WEB-CHECKLIST.md
+
+# 系统
+Thumbs.db
+.DS_Store

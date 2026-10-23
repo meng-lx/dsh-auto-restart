@@ -1,0 +1,14 @@
+# dsh-auto-restart bundle patch
+#
+# 本包的 `dsh.bundle.patch` 层：正式安装时，profile 启动会把下面这条 insert
+# 合并进 cordis 树，从而挂载本插件的 Host 半边（工具入口 + 状态路由）。
+#
+# 行的 `name` 必须等于包名 —— 客户端模块注册表也按包名对上它的 loader 条目
+# （`dsh.client` 段已写在 package.json 里）。
+#
+# ⚠ 改完本文件要重启 DSH Desktop；但改包内源码（index.js / client.js）不必：
+#   在插件市场里把本插件关掉再打开（enabled: false → true）就会重新 apply()。
+
+- insert:
+    - id: dsh-auto-restart
+      name: 'dsh-auto-restart'
