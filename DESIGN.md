@@ -363,7 +363,6 @@ D:\DeepSeek Harness\dsh-auto-restart\
   DESIGN.md              本文件（唯一权威）
   README.md              用法
   SETUP.md               给 agent 的说明书：默认覆盖不到的环境怎么一次性配好
-  HANDOFF.md             1.1 的交接说明（跨机器协作时用）
   package.json           插件包（dsh.bundle.patch + dsh.client）
   cordis.patch.yml       启用条目
   index.js               Host：工具 + 空闲判定 + 倒计时 + 计划门 + 拉脚本 + 状态路由
@@ -499,7 +498,8 @@ Host/Client 主文件放包根（`index.js` / `client.js`），只有启动计�
    `DESIGN.md`、`_probe/`、`test/` 由 `.gitignore` 排除。
    当时的 gate 只差「仓库满 1 天」这一条，24 小时后自动转绿。
 7. **1.1 已合并回主目录**：`dsh-auto-restart-web` 里那份 `lib/launch-plan.js` 与两个
-   重写的 `.ps1` 已替换主目录版本；`SETUP.md`、`install.ps1`、`HANDOFF.md` 一并进入。
+   重写的 `.ps1` 已替换主目录版本；`SETUP.md`、`install.ps1` 一并进入。
+   （原 `HANDOFF.md` 的动机与踩坑已并入第十八节，文件本身已删除。）
    `45c9e32`（入口不再预扫）已同步，`test/idle-check.mjs` 49 项全过。
    下一步：把 1.1 推上 GitHub、更新 README 的口径、按 `WEB-CHECKLIST.md` 在网页端再走一遍。
 
@@ -545,3 +545,68 @@ Host/Client 主文件放包根（`index.js` / `client.js`），只有启动计�
   各跑一遍，能直接看到抛在哪一行），都过了再热重载。
 - **别对正在跑的页面调 `Page.reload`**：DSH 的 web boot 会重新检查每个 entry，
   任何一次失败的导入都会变成"DSH 起不来"，而不会退化成"这一个插件没生效"。
+
+## 十八、1.1 为什么这么改（决策记录）
+
+这一节回答「为什么不是多写几条 if」，也是 1.1 那次改造的动机原文。
+
+### 问题：旧实现把路径写死
+
+`scripts/Start-DSH.ps1` 旧版按 `%LOCALAPPDATA%\Programs\DeepSeek Harness\resources\runtime\cli\bin\dsh.cmd`
+启动，npm / pnpm / volta / scoop / 源码 装法全落空；而 `Restart-DSH.ps1` 是**先杀宿主再启动**，
+于是"重启一次 = DSH 再也起不来"。
+
+目标定成「上插件市场」后，这个前提就不成立了：两台电脑装法不同，同一台机器还会随用户
+升级/换装而变。**多写几条 if 是在赌用户怎么装**，赌错一次的代价是 DSH 起不来。
+
+### 关键认知：argv 重放对安装方式免疫
+
+不管 `npm -g` 还是 pnpm 的 shim，node 进程里的 `process.argv` 都已经是
+`["node", "<绝对路径>/@deepseek-ai/dsh/lib/bin.js", "web"]`，shim 只是转发。
+所以「DSH 装在哪」这个问题**根本不用回答**——这也是为什么方案里没有一处是推断出来的路径。
+
+### 三段式
+
+```
+宿主事实(hostFacts) → 启动计划(launch-plan.json) → 校验(validatePlan) → 计划门（不可用就不杀）
+```
+
+- **事实**：`lib/launch-plan.js: readHostFacts(webServer)` 读
+  `process.argv / execPath / cwd / versions.electron / webServer.getOrigin() / profile / dsh 版本`，
+  每次现读不缓存。
+- **计划**：`buildLaunchPlan(facts, launchCommand)` 产出三种 mode——
+
+  | mode | 何时 | exe | args | env |
+  |---|---|---|---|---|
+  | `web` | 非 Electron，或 Electron 里跑的入口是 DSH 自己 | `process.execPath` | `[entry, ...argv.slice(2)]` 原样重放 | Electron 里补 `ELECTRON_RUN_AS_NODE=1` |
+  | `desktop` | Electron 且入口不是 DSH（官方桌面壳） | 外壳 exe | `[]` | **删掉** `ELECTRON_RUN_AS_NODE`（继承它会把桌面端拉成 node） |
+  | `custom` | 设置了 `launchCommand` | `cmd.exe /d /s /c` | 用户那条命令 | — |
+
+- **校验**：`validatePlan` 检查 exe/entry 文件存在、端口 0..65535。reason 取值：
+  `no-plan / empty-command / unknown-mode / no-exe / exe-missing / entry-missing / bad-port`。
+- **计划门**：两道。`Restart-DSH.ps1` 在 Sleep 与 kill 之前校验，不可用就 `throw` 并
+  `Set-WakePhase failed`；插件侧 `finishCountdown()` 也先校验再落盘再 spawn。
+  两道门保证「宁可重启失败，也不让 DSH 停在关闭状态」。
+
+### 唯一的人工闸门：`needsSetup`
+
+工具 `restart_dsh` 在 execute 里做两道前置门：
+
+1. `allowAutoRestart=false` → `reason: "disabled"`（给「我被 systemd/pm2 托管」的用户让位）；
+2. `validatePlan` 失败 → `reason: "needsSetup"`，并在 **message 里**（不是额外字段——
+   `output.render` 只输出 message，agent 能看到的只有它）拼上完整宿主自述 + 三步指令：
+   拼一条命令 → **在对话里问用户并说明「这条命令以后每次重启都会以你的权限执行」** →
+   写进 `settings.json` 的 `launchCommand` 再来一次。
+
+**禁止**：agent 自己静默写 `launchCommand`（它会读网页等不可信内容，等于持久化后门）、
+改 `.ps1`、自己 `taskkill`、把 `allowAutoRestart=false` 当修复。细则见 `SETUP.md`。
+
+### 两个实测坑
+
+1. **触发方式决定 `sessionId`**。走工具时后端取 `exec.agent.id`，交接文件带得上会话 id，
+   唤醒能投达；而裸 `POST /auto-restart/api/restart` 且 body 不带 `sessionId` 时，
+   写出的请求 `sessionId` 是空串，新宿主会跳过唤醒 —— 表现为「重启成功但没人叫醒会话」。
+   **验证唤醒必须走工具。**
+2. **重放 argv 会把「开浏览器」一起重放**。`dsh web` 默认开浏览器，重放后每次重启多开
+   一个标签页。`buildLaunchPlan` 的 web 分支已补：命令行里没有 `--no-open` 就追加。
+   这一行只对**下一次**重启生效 —— 正在跑的进程用的是启动时加载的那份模块。
