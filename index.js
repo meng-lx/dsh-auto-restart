@@ -21,6 +21,14 @@ import { appendFileSync, mkdirSync, readFileSync, readdirSync, rmSync, unlinkSyn
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 
+import {
+  buildLaunchPlan,
+  planFilePath,
+  readHostFacts,
+  validatePlan,
+  writePlanFile,
+} from './lib/launch-plan.js'
+
 /** 本插件包的根目录（本文件就在包根）。 */
 const PACKAGE_ROOT = import.meta.dirname
 
@@ -158,6 +166,15 @@ const RUN_RESULT_FILE = join(STATE_DIR, 'last-run.json')
  */
 const SETTINGS_FILE = join(STATE_DIR, 'settings.json')
 
+/**
+ * 启动计划：宿主把自己「怎么跑起来的」写在这，脚本照着它重启。
+ *
+ * 为什么不放在 settings.json 里：它是**观察结果**（argv/execPath/端口），不是偏好，
+ * 每次重启前都要重写一遍；混进设置文件会让「用户改过什么」变得看不出来。
+ * 生成逻辑在 `lib/launch-plan.js`，这里只负责落盘和路径传递。
+ */
+const PLAN_FILE = planFilePath(STATE_DIR)
+
 /** 落盘记录的有效期：超过这个时间还没投递就当它陈旧了。 */
 const PENDING_TTL_MS = 15 * 60 * 1000
 
@@ -194,13 +211,20 @@ function clampInt(value, min, max, fallback) {
   return Math.min(max, Math.max(min, Math.round(n)))
 }
 
-/** 没有任何历史设置文件时，五项设置各取什么。 */
+/** 没有任何历史设置文件时，七项设置各取什么。 */
 const SETTINGS_DEFAULTS = {
   autoSay: DEFAULT_AUTOSAY,
   timeoutSec: DEFAULT_TIMEOUT_SEC,
   countdownSec: DEFAULT_COUNTDOWN,
   logKeep: DEFAULT_LOG_KEEP,
   wakeMode: DEFAULT_WAKE_MODE,
+  /**
+   * 启动命令覆盖。空字符串 = 自动（宿主自述 + argv 重放），这是默认路径。
+   * 只有重放不可行时（npx 缓存被清、自制 bat 包装、容器）才由 agent 写一条完整命令。
+   */
+  launchCommand: '',
+  /** 总开关。false 时 `restart_dsh` 直接拒绝，连倒计时都不进。 */
+  allowAutoRestart: true,
 }
 
 /**
@@ -227,6 +251,13 @@ function loadSettings() {
   }
   if (saved.wakeMode === 'plugin' || saved.wakeMode === 'script') {
     merged.wakeMode = saved.wakeMode
+  }
+  if (typeof saved.launchCommand === 'string') {
+    // 空串是合法值（= 回到自动），所以这里不判长度，只裁长度上限。
+    merged.launchCommand = saved.launchCommand.trim().slice(0, 2000)
+  }
+  if (saved.allowAutoRestart === false || saved.allowAutoRestart === true) {
+    merged.allowAutoRestart = saved.allowAutoRestart
   }
   return merged
 }
@@ -357,8 +388,11 @@ function decodeConsole(buffer) {
  *
  * `-Mode` 不传：脚本自己判断载体（有主窗口=桌面端，没有=网页端）。
  * `-WebPort` 传当前端口：网页端重启后必须绑回同一个端口，页面才连得回来。
+ *
+ * `planPath` 是**必给**的：脚本只照计划执行，不再自己猜 dsh 装在哪。
+ * 没有计划就什么都不杀（见 `finishCountdown` 的校验门）。
  */
-function launchScript(scriptPath, command, autoSay, commandTimeoutSec, webPort) {
+function launchScript(scriptPath, command, autoSay, commandTimeoutSec, webPort, planPath) {
   return new Promise((resolve) => {
     let settled = false
     /** 收集原始字节，最后再决定用哪种编码解 —— 见 decodeConsole 的注释。 */
@@ -385,6 +419,9 @@ function launchScript(scriptPath, command, autoSay, commandTimeoutSec, webPort) 
     ]
     if (Number.isInteger(webPort) && webPort > 0) {
       scriptArgs.push('-WebPort', String(webPort))
+    }
+    if (typeof planPath === 'string' && planPath.length > 0) {
+      scriptArgs.push('-PlanPath', planPath)
     }
     // 把自己的 pid 交给脚本：载体（桌面端/网页端）由脚本猜会猜错 ——
     // 两个实例并存时「有窗口=桌面端」这条判据会把网页端内核一起杀掉。
@@ -906,6 +943,8 @@ export function apply(ctx, config = {}) {
     files: {
       wakeRequest: WAKE_REQUEST_FILE,
       lastRun: RUN_RESULT_FILE,
+      plan: PLAN_FILE,
+      settings: SETTINGS_FILE,
     },
     limits: {
       countdownSec: [MIN_COUNTDOWN, MAX_COUNTDOWN],
@@ -918,6 +957,8 @@ export function apply(ctx, config = {}) {
       countdownSec: DEFAULT_COUNTDOWN,
       logKeep: DEFAULT_LOG_KEEP,
       wakeMode: DEFAULT_WAKE_MODE,
+      launchCommand: '',
+      allowAutoRestart: true,
     },
   })
 
@@ -945,6 +986,15 @@ export function apply(ctx, config = {}) {
     if (p.wakeMode === 'plugin' || p.wakeMode === 'script') {
       settings.wakeMode = p.wakeMode
       changed.push('wakeMode')
+    }
+    if (typeof p.launchCommand === 'string') {
+      // 空串也接受：那是「清掉覆盖、回到自动」的合法写法。
+      settings.launchCommand = p.launchCommand.trim().slice(0, 2000)
+      changed.push('launchCommand')
+    }
+    if (p.allowAutoRestart === false || p.allowAutoRestart === true) {
+      settings.allowAutoRestart = p.allowAutoRestart
+      changed.push('allowAutoRestart')
     }
     // 内存里先生效，再落盘：写盘失败只是"下次重启会丢"，不该让这次保存看起来没成功。
     if (changed.length > 0 && !writeSettingsFile(settings)) {
@@ -985,6 +1035,14 @@ export function apply(ctx, config = {}) {
       return getService('webServer')
     },
   }
+
+  /**
+   * 宿主的自我描述，每次用都现读。
+   *
+   * 不缓存的原因：端口可能被桌面壳换掉、profile 可能被 rescue 换过、
+   * 进程 cwd 也可能在会话里被切走。缓存一份等于拿旧事实去杀进程。
+   */
+  const hostFacts = () => readHostFacts(services.webServer)
 
   const snapshot = () => ({
     phase: state.phase,
@@ -1081,6 +1139,40 @@ export function apply(ctx, config = {}) {
 
     setState({ phase: 'launching', deadline: 0, blockers: [] })
 
+    // 动手之前最后一道门：把「怎么再拉起一次」落成计划文件，脚本照计划执行。
+    //
+    // 计划由宿主自述生成（argv/execPath/cwd/getOrigin），不猜安装路径。
+    // 计划不可用就**什么都不杀** —— 这一次重启作废，但 DSH 还活着；
+    // 反过来（先杀再发现起不来）就是用户最痛的那个失败：服务没了，只能手动开。
+    const plan = buildLaunchPlan(hostFacts(), loadSettings().launchCommand)
+    const planCheck = validatePlan(plan)
+    if (!planCheck.ok) {
+      logger.line(`启动计划不可用（${planCheck.reason} ${planCheck.detail ?? ''}），放弃重启，DSH 未关闭`)
+      setState({
+        phase: 'failed',
+        deadline: 0,
+        countdownSec: 0,
+        last: { at: Date.now(), ok: false, reason: 'no-launch-plan' },
+        message:
+          `无法确定这台机器上该怎么重新启动 DSH（${planCheck.reason}` +
+          `${planCheck.detail ? '：' + planCheck.detail : ''}），这次重启已取消，DSH 仍在运行。` +
+          `请让 agent 读插件包里的 SETUP.md，把启动命令写进 ${SETTINGS_FILE} 的 launchCommand 再来一次。`,
+      })
+      return
+    }
+    if (!writePlanFile(PLAN_FILE, plan)) {
+      logger.line(`计划写不进去（${PLAN_FILE}），放弃重启，DSH 未关闭`)
+      setState({
+        phase: 'failed',
+        deadline: 0,
+        countdownSec: 0,
+        last: { at: Date.now(), ok: false, reason: 'plan-write-failed' },
+        message: `启动计划写不进 ${PLAN_FILE}，这次重启已取消，DSH 仍在运行。`,
+      })
+      return
+    }
+    logger.line(`启动计划：${PLAN_FILE}（mode=${plan.mode} exe=${plan.exe} 端口=${plan.port}）`)
+
     // 先落盘再动手：万一脚本把 DSH 杀了而我们自己没来得及写，唤醒就丢了。
     // 写的是两阶段文件的前半段（唤醒谁、说什么）；后半段（成没成、何时成）
     // 由脚本在拉起 DSH 之后补上，插件再来读。
@@ -1113,7 +1205,8 @@ export function apply(ctx, config = {}) {
       // plugin 模式下让脚本别插手唤醒（-AutoSay 留空 = 不发）
       wakeMode === 'plugin' ? '' : autoSay,
       timeoutSec,
-      services.webServer?.port,
+      plan.port,
+      PLAN_FILE,
     )
     logger.line(`脚本返回：${JSON.stringify(result)}`)
 
@@ -1205,7 +1298,9 @@ export function apply(ctx, config = {}) {
       '`command` 只在「重启期间顺带做一件事」时才需要；纯重启就别传它，不要为了占位而传一条无害命令。' +
       '倒计时由插件在后台走秒，工具会立刻返回：这几十秒里你可以继续把这一轮说完。' +
       '秒数走完时再判一次 —— 除了插件自己，只要有会话或后台任务还在跑，这次重启就作废，' +
-      '不会重启，也不会自动重试。',
+      '不会重启，也不会自动重试。' +
+      '如果本机还没适配（返回 reason=needsSetup），先按 message 里的三步做：拿宿主自述拼命令 → ' +
+      '让用户在对话里确认 → 写进 settings.json 的 launchCommand，再调一次。',
     parameters: {
       type: 'object',
       properties: {
@@ -1308,6 +1403,64 @@ export function apply(ctx, config = {}) {
           reason: 'already-running',
           phase: state.phase,
           message: '已经有一次重启在倒计时/启动中，这次调用忽略。',
+        }
+      }
+
+      // 现读设置：agent 可能刚把 launchCommand 写进文件，而内存里那份还是旧的。
+      const fresh = loadSettings()
+
+      // 总开关。关掉之后连倒计时都不进 —— 这是「我不想让任何东西自动重启 DSH」的表达。
+      if (fresh.allowAutoRestart === false) {
+        return {
+          ok: false,
+          reason: 'disabled',
+          phase: state.phase,
+          message:
+            '自动重启已关闭（settings.json 里 allowAutoRestart=false）。需要重启请手动操作，' +
+            '或把该字段改成 true（删掉也等于 true）后再调用 restart_dsh。',
+        }
+      }
+
+      // 进场先确认「这台机器上确实存在一种能把它再拉起来的办法」。
+      //
+      // 这一步必须在倒计时之前做：倒计时走完才发现起不来，等于把人骗到遮罩页上再告诉他重启失败，
+      // 而那时候进程已经被杀了。
+      const planNow = buildLaunchPlan(hostFacts(), fresh.launchCommand)
+      const planCheck = validatePlan(planNow)
+      if (!planCheck.ok) {
+        const facts = hostFacts()
+        const 自述 = [
+          `argv: ${JSON.stringify(facts.argv)}`,
+          `execPath: ${facts.execPath || '（空）'}`,
+          `cwd: ${facts.cwd || '（空）'}`,
+          `origin: ${facts.origin || '（空）'}  ← 重启后必须还是这个地址，页面才连得回来`,
+          `profile: ${facts.profile || '（空）'}`,
+          `dshVersion: ${facts.dshVersion || '（未知）'}`,
+          `electron: ${facts.electron ? '是（跑在桌面端外壳里）' : '否'}`,
+        ].join('\n')
+        logger.line(`启动计划不可用（${planCheck.reason} ${planCheck.detail ?? ''}），返回 needsSetup`)
+        return {
+          ok: false,
+          reason: 'needsSetup',
+          phase: state.phase,
+          message: [
+            `重启被拦下：插件没法确定在这台机器上怎么重新启动 DSH（${planCheck.reason}` +
+              `${planCheck.detail ? '：' + planCheck.detail : ''}）。DSH 没有被关闭，也没有进入倒计时。`,
+            '',
+            '宿主自述（真实值，不要自己猜）：',
+            自述,
+            '',
+            '接下来由你完成，一共三步：',
+            '1. 用上面的自述拼一条「把同样形态的 DSH 从零拉起来」的命令。别改 profile，别改端口 ——',
+            '   端口变了页面就连不回来；profile 变了就不是同一个 DSH 了。',
+            '2. 在对话里把这条命令的原文发给用户，明确告诉他：这条命令会在每次重启时以他的权限执行。',
+            '   必须等到他明确同意再往下走。',
+            `3. 用户确认后，把命令写进 ${SETTINGS_FILE} 的 launchCommand 字段（JSON 字符串，`,
+            '   反斜杠要转义），然后再次调用 restart_dsh。',
+            '',
+            '不要改插件里的 .ps1，不要自己结束进程。写完之后可以再调一次本工具，它会先验证再动手。',
+            '细则见插件包里的 SETUP.md。',
+          ].join('\n'),
         }
       }
 
@@ -1524,4 +1677,11 @@ export const __test = {
   writeSettingsFile,
   SETTINGS_DEFAULTS,
   SETTINGS_FILE,
+  // 启动计划：判定逻辑纯函数，可以在没有宿主的环境里直接测。
+  buildLaunchPlan,
+  validatePlan,
+  readHostFacts,
+  planFilePath,
+  writePlanFile,
+  PLAN_FILE,
 }

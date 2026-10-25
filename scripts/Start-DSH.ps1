@@ -14,6 +14,11 @@
 .PARAMETER Mode
     desktop（默认）或 web。
 
+.PARAMETER PlanPath
+    启动计划文件的路径（由宿主插件写）。给了它就以计划为准：mode / exe / 参数 /
+    工作目录 / 端口 / 环境变量全部来自计划，-Mode、-ExePath、-DshCmdPath、
+    -WebPort 只对不传计划的旧调用方还起作用。
+
 .PARAMETER TimeoutSec
     等待就绪的上限秒数，默认 120。
 
@@ -77,19 +82,39 @@ param(
     [switch]$OpenBrowser,
     [string]$ExePath,
     [string]$DshCmdPath,
+    # 启动计划：宿主插件用它把「自己是怎么跑起来的」交给脚本，见 lib/launch-plan.js。
+    [string]$PlanPath,
     [string]$LogPath
 )
 
 $ErrorActionPreference = 'Stop'
 
-if (-not $ExePath) {
-    $ExePath = Join-Path $env:LOCALAPPDATA 'Programs\DeepSeek Harness\DeepSeek Harness.exe'
-}
-if (-not $DshCmdPath) {
-    $DshCmdPath = Join-Path (Split-Path -Path $ExePath -Parent) 'resources\runtime\cli\bin\dsh.cmd'
+# ---------- 启动计划 ----------
+# 计划里全是宿主自述的真实值（execPath、argv、cwd、端口），所以有它就不要再猜。
+# 下面的默认值（%LOCALAPPDATA%\Programs\DeepSeek Harness\...）只对官方桌面端的
+# 默认安装位置成立；npm/pnpm 装出来的 DSH 在那个位置什么都没有。
+$plan = $null
+if (-not [string]::IsNullOrWhiteSpace($PlanPath)) {
+    if (-not (Test-Path -LiteralPath $PlanPath)) {
+        throw ('找不到启动计划：' + $PlanPath)
+    }
+    try {
+        $plan = Get-Content -LiteralPath $PlanPath -Raw -Encoding UTF8 | ConvertFrom-Json
+    } catch {
+        throw ('启动计划不是合法 JSON：{0}（{1}）' -f $PlanPath, $_.Exception.Message)
+    }
 }
 
 $ProcName = 'DeepSeek Harness'
+
+if (-not $plan) {
+    if (-not $ExePath) {
+        $ExePath = Join-Path $env:LOCALAPPDATA 'Programs\DeepSeek Harness\DeepSeek Harness.exe'
+    }
+    if (-not $DshCmdPath) {
+        $DshCmdPath = Join-Path (Split-Path -Path $ExePath -Parent) 'resources\runtime\cli\bin\dsh.cmd'
+    }
+}
 
 if (-not $LogPath) {
     $logDir = Join-Path $PSScriptRoot 'logs'
@@ -104,6 +129,111 @@ function Write-Log {
     $line = '[{0}] {1}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Message
     Write-Host $line
     Add-Content -LiteralPath $LogPath -Value $line -Encoding UTF8
+}
+
+# ---------- 把计划变成启动参数 ----------
+#
+# 为什么不用 Start-Process -ArgumentList：那个参数是按空格拼字符串的，遇到带空格的
+# 路径要么自己加引号（然后被双重转义）、要么被重新分词。这里用 ProcessStartInfo
+# 配一段标准的 Windows 参数转义，语义与 node 的 spawn 对齐。
+function ConvertTo-QuotedArgument {
+    param([string]$Value)
+    if ($null -eq $Value -or $Value -eq '') { return '""' }
+    if ($Value -notmatch '[\s"]') { return $Value }
+    $sb = New-Object System.Text.StringBuilder
+    [void]$sb.Append('"')
+    $backslashes = 0
+    foreach ($ch in $Value.ToCharArray()) {
+        if ($ch -eq '\') { $backslashes++; continue }
+        if ($ch -eq '"') {
+            [void]$sb.Append(('\' * ($backslashes * 2 + 1)) + '"')
+            $backslashes = 0
+            continue
+        }
+        if ($backslashes -gt 0) { [void]$sb.Append('\' * $backslashes); $backslashes = 0 }
+        [void]$sb.Append($ch)
+    }
+    if ($backslashes -gt 0) { [void]$sb.Append('\' * ($backslashes * 2)) }
+    [void]$sb.Append('"')
+    return $sb.ToString()
+}
+
+# 照计划拉起进程。$ExtraArgs 追加在计划参数之后（桌面端用它加 --remote-debugging-port）。
+function Start-FromPlan {
+    param([string[]]$ExtraArgs = @())
+
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+
+    if ([string]$plan.mode -eq 'custom') {
+        # 自定义命令：交给 cmd 解释 —— 用户填的就是一行能在 cmd 里跑的命令。
+        $psi.FileName = 'cmd.exe'
+        $psi.Arguments = '/d /s /c "' + [string]$plan.command + '"'
+        Write-Log ('启动（自定义命令）：{0}' -f $plan.command)
+    } else {
+        if (-not (Test-Path -LiteralPath ([string]$plan.exe))) {
+            throw ('启动计划里的程序不存在：' + [string]$plan.exe)
+        }
+        $argvList = New-Object System.Collections.Generic.List[string]
+        foreach ($a in @($plan.args)) {
+            if ($null -ne $a) { $argvList.Add([string]$a) }
+        }
+        foreach ($a in @($ExtraArgs)) {
+            if ($null -ne $a -and "$a" -ne '') { $argvList.Add([string]$a) }
+        }
+        $psi.FileName = [string]$plan.exe
+        $psi.Arguments = (($argvList | ForEach-Object { ConvertTo-QuotedArgument $_ }) -join ' ')
+        Write-Log ('启动（重放）：{0} {1}' -f $psi.FileName, $psi.Arguments)
+    }
+
+    $cwd = [string]$plan.cwd
+    if (-not [string]::IsNullOrWhiteSpace($cwd) -and (Test-Path -LiteralPath $cwd)) {
+        $psi.WorkingDirectory = $cwd
+        Write-Log ('工作目录：{0}' -f $cwd)
+    }
+
+    # env：值为 null 表示「从子进程环境里删掉这个变量」。
+    # 桌面端必须删掉 ELECTRON_RUN_AS_NODE，否则拉起来的是个 node，没有界面。
+    if ($null -ne $plan.env) {
+        foreach ($p in $plan.env.PSObject.Properties) {
+            if ($null -eq $p.Value) {
+                [void]$psi.EnvironmentVariables.Remove($p.Name)
+                Write-Log ('环境：移除 {0}' -f $p.Name)
+            } else {
+                $psi.EnvironmentVariables[$p.Name] = [string]$p.Value
+                Write-Log ('环境：{0}={1}' -f $p.Name, $p.Value)
+            }
+        }
+    }
+
+    return [System.Diagnostics.Process]::Start($psi)
+}
+
+if ($plan) {
+    Write-Log ('读取启动计划：{0}' -f $PlanPath)
+    Write-Log ('  mode={0} profile={1} 端口={2} 版本={3}' -f $plan.mode, $plan.profile, $plan.port, $plan.dshVersion)
+    switch ([string]$plan.mode) {
+        'web' {
+            $Mode = 'web'
+            if ([int]$plan.port -gt 0) { $WebPort = [int]$plan.port }
+            if (-not [string]::IsNullOrWhiteSpace([string]$plan.host)) { $WebHost = [string]$plan.host }
+        }
+        'desktop' {
+            $Mode = 'desktop'
+            if (-not [string]::IsNullOrWhiteSpace([string]$plan.exe)) {
+                # 外壳 exe 不一定叫 'DeepSeek Harness'（第三方壳、换名安装），
+                # 就绪判据和杀进程都按真实 exe 名来。
+                $ProcName = [System.IO.Path]::GetFileNameWithoutExtension([string]$plan.exe)
+            }
+        }
+        'custom' {
+            # 自定义命令拉起来的是什么，脚本不知道：有端口就按网页端等端口，没有就按桌面端等窗口。
+            if ([int]$plan.port -gt 0) { $Mode = 'web'; $WebPort = [int]$plan.port } else { $Mode = 'desktop' }
+        }
+        default { throw ('启动计划里的 mode 不认识：' + [string]$plan.mode) }
+    }
+    Write-Log ('  载体：{0}（进程名={1}，端口={2}）' -f $Mode, $ProcName, $WebPort)
 }
 
 # 网页端启动后把 PID 记下来：重启脚本要靠它精确杀掉"那一份"，
@@ -154,19 +284,25 @@ if ($Mode -eq 'web') {
         return 'already-running'
     }
 
-    if (-not (Test-Path -LiteralPath $DshCmdPath)) {
-        Write-Log ('找不到命令行入口：{0}' -f $DshCmdPath)
-        throw ('找不到 dsh 命令行入口：' + $DshCmdPath)
+    if ($plan) {
+        # 计划里的参数已经是当初启动这台的完整 argv（profile/host/port 都在里面），
+        # 原样重放，不重新拼一份 —— 重新拼就等于把「它当时怎么跑的」改成「我们以为它该怎么跑」。
+        $proc = Start-FromPlan
+    } else {
+        if (-not (Test-Path -LiteralPath $DshCmdPath)) {
+            Write-Log ('找不到命令行入口：{0}' -f $DshCmdPath)
+            throw ('找不到 dsh 命令行入口：' + $DshCmdPath)
+        }
+
+        $argList = @('--profile', 'web', '--host', $WebHost, '--port', [string]$WebPort)
+        if (-not $OpenBrowser) { $argList += '--no-open' }
+
+        Write-Log ('启动：{0} {1}' -f $DshCmdPath, ($argList -join ' '))
+        $proc = Start-Process -FilePath $DshCmdPath `
+            -ArgumentList $argList `
+            -WorkingDirectory (Split-Path -Path $DshCmdPath -Parent) `
+            -WindowStyle Hidden -PassThru
     }
-
-    $argList = @('--profile', 'web', '--host', $WebHost, '--port', [string]$WebPort)
-    if (-not $OpenBrowser) { $argList += '--no-open' }
-
-    Write-Log ('启动：{0} {1}' -f $DshCmdPath, ($argList -join ' '))
-    $proc = Start-Process -FilePath $DshCmdPath `
-        -ArgumentList $argList `
-        -WorkingDirectory (Split-Path -Path $DshCmdPath -Parent) `
-        -WindowStyle Hidden -PassThru
     Write-Log ('已拉起 PID {0}' -f $proc.Id)
     Write-ServerState -ProcessId $proc.Id -Port $WebPort
 
@@ -305,17 +441,27 @@ if ($running.Count -gt 0) {
     return 'already-running'
 }
 
-if (-not (Test-Path -LiteralPath $ExePath)) {
-    Write-Log ('找不到程序：{0}' -f $ExePath)
-    throw ('找不到 DSH 主程序：' + $ExePath)
-}
-
-Write-Log ('启动：{0}' -f $ExePath)
-if ($DebugPort -gt 0 -and $AutoSay) {
-    Write-Log ('调试端口：{0}（供 say.js 定向注入）' -f $DebugPort)
-    Start-Process -FilePath $ExePath -WorkingDirectory (Split-Path -Path $ExePath -Parent) -ArgumentList ('--remote-debugging-port={0}' -f $DebugPort)
+if ($plan) {
+    # 桌面端：重放外壳 exe（参数为空，环境里已经去掉了 ELECTRON_RUN_AS_NODE）。
+    if ($DebugPort -gt 0 -and $AutoSay) {
+        Write-Log ('调试端口：{0}（供 say.js 定向注入）' -f $DebugPort)
+        $null = Start-FromPlan -ExtraArgs @(('--remote-debugging-port={0}' -f $DebugPort))
+    } else {
+        $null = Start-FromPlan
+    }
 } else {
-    Start-Process -FilePath $ExePath -WorkingDirectory (Split-Path -Path $ExePath -Parent)
+    if (-not (Test-Path -LiteralPath $ExePath)) {
+        Write-Log ('找不到程序：{0}' -f $ExePath)
+        throw ('找不到 DSH 主程序：' + $ExePath)
+    }
+
+    Write-Log ('启动：{0}' -f $ExePath)
+    if ($DebugPort -gt 0 -and $AutoSay) {
+        Write-Log ('调试端口：{0}（供 say.js 定向注入）' -f $DebugPort)
+        Start-Process -FilePath $ExePath -WorkingDirectory (Split-Path -Path $ExePath -Parent) -ArgumentList ('--remote-debugging-port={0}' -f $DebugPort)
+    } else {
+        Start-Process -FilePath $ExePath -WorkingDirectory (Split-Path -Path $ExePath -Parent)
+    }
 }
 
 $deadline = (Get-Date).AddSeconds($TimeoutSec)

@@ -6,8 +6,7 @@ _probe/
 *.log
 *.zip
 
-# 内部规格与验证清单，不对外发布
-DESIGN.md
+# 内部验证清单，不对外发布
 WEB-CHECKLIST.md
 
 # 系统

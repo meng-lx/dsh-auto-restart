@@ -1,6 +1,6 @@
 {
   "name": "dsh-auto-restart",
-  "version": "0.1.0",
+  "version": "1.1.0",
   "private": true,
   "type": "module",
   "description": "等整个 DSH 都空闲下来再安全地重启它：占用判定、可取消倒计时、拉起外部重启脚本。",
@@ -15,10 +15,12 @@
   "files": [
     "index.js",
     "client.js",
+    "lib/launch-plan.js",
     "cordis.patch.yml",
     "locale/*.json",
     "icon.svg",
     "README.md",
+    "SETUP.md",
     "install.ps1",
     "scripts/Restart-DSH.ps1",
     "scripts/Start-DSH.ps1",

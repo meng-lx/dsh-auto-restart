@@ -17,7 +17,12 @@
     要在 DSH 关闭后执行的命令（PowerShell 语法）。退出码和输出都会写进日志。
 
 .PARAMETER WorkDir
-    执行命令时的工作目录，默认 D:\DeepSeek Harness。
+    执行命令时的工作目录。默认空 = 用启动计划里的 cwd（宿主当时所在目录），
+    计划也没有就落到脚本目录。
+
+.PARAMETER PlanPath
+    启动计划文件（宿主插件写的）。脚本照它重启：mode / exe / 参数 / cwd / 端口全来自计划。
+    没有可用计划时不关任何进程。见插件包 SETUP.md。
 
 .PARAMETER GraceSec
     关闭 DSH 前先等待的秒数，默认 8 秒（留给当前对话把回复发完）。
@@ -43,7 +48,7 @@
 [CmdletBinding()]
 param(
     [string]$Command,
-    [string]$WorkDir = 'D:\DeepSeek Harness',
+    [string]$WorkDir = '',
     [int]$GraceSec = 0,
     [int]$SettleSec = 8,
     [switch]$NoStart,
@@ -58,6 +63,9 @@ param(
     # 调用方（宿主插件）自己的进程号。由插件传入，用来精确判定载体、精确关进程。
     # 不传就退回旧的「按窗口 / 按端口」猜法。
     [int]$OwnerPid = 0,
+    # 启动计划（由宿主插件写）。它描述「怎么再启动一次」，见 lib/launch-plan.js。
+    # 没有可用计划就**不关任何进程** —— 猜错安装位置的代价是把 DSH 杀掉再起不来。
+    [string]$PlanPath,
     [string]$JobFile
 )
 
@@ -120,10 +128,114 @@ function Write-JsonFile {
     [System.IO.File]::WriteAllText($Path, $json, $enc)
 }
 
+# ---------- 启动计划 ----------
+#
+# 计划里全是宿主自述的真实值（execPath、argv、cwd、端口），所以脚本不再猜
+# 「dsh 装在哪」、也不再自己拼启动参数。校验照 Node 那边的 validatePlan 来，
+# 目的是**在杀进程之前**就判断出这次重启能不能成。
+function Read-LaunchPlan {
+    if ([string]::IsNullOrWhiteSpace($PlanPath)) { return $null }
+    if (-not (Test-Path -LiteralPath $PlanPath)) { return $null }
+    try {
+        return (Get-Content -LiteralPath $PlanPath -Raw -Encoding UTF8 | ConvertFrom-Json)
+    } catch {
+        return $null
+    }
+}
+
+# 返回空串 = 可用；否则返回短原因（会写进日志和交接文件）。
+function Test-LaunchPlan {
+    param($Plan)
+    if ($null -eq $Plan) { return 'no-plan' }
+    $m = [string]$Plan.mode
+    if ($m -eq 'custom') {
+        if ([string]::IsNullOrWhiteSpace([string]$Plan.command)) { return 'empty-command' }
+        return ''
+    }
+    if ($m -ne 'web' -and $m -ne 'desktop') { return ('unknown-mode:' + $m) }
+    if ([string]::IsNullOrWhiteSpace([string]$Plan.exe)) { return 'no-exe' }
+    if (-not (Test-Path -LiteralPath ([string]$Plan.exe))) { return ('exe-missing:' + [string]$Plan.exe) }
+    if ($m -eq 'web') {
+        $entry = [string](@($Plan.args)[0])
+        if ([string]::IsNullOrWhiteSpace($entry)) { return 'entry-missing' }
+        if (-not (Test-Path -LiteralPath $entry)) { return ('entry-missing:' + $entry) }
+    }
+    return ''
+}
+
+# ---------- 独立进程：三条路，能走哪条走哪条 ----------
+#
+# 为什么非要有独立进程：这个脚本是被 DSH 自己拉起来的，关 DSH 用的是
+# `taskkill /T /F`（连子进程一起），所以脚本要是还在原来的进程树里，它会在
+# 关掉 DSH 的同时把自己也关掉，后面的「重新启动」永远执行不到。
+#
+# 三条路的差别只在「谁能不死」：
+#   task     计划任务（cmdlet）—— Task Scheduler 在用户交互会话里拉起，最接近用户自己双击
+#   schtasks 计划任务（命令行）—— 同一个 Task Scheduler，权限要求不同，有的机器只通这一条
+#   wmi      Win32_Process.Create —— 父进程是 WmiPrvSE，压根不在 DSH 的进程树里，
+#            taskkill /T 带不走它；仍然落在调用者的会话里（窗口能正常出现）
+#
+# 三条都不通就抛错——在杀进程**之前**抛，宁可这次不重启。
+function Start-DetachedProcess {
+    param(
+        [Parameter(Mandatory = $true)][string]$PsExe,
+        [Parameter(Mandatory = $true)][string]$Argument,
+        [Parameter(Mandatory = $true)][string]$TaskName,
+        [int]$TimeoutSeconds = 900
+    )
+    $errors = @()
+
+    try {
+        $action    = New-ScheduledTaskAction -Execute $PsExe -Argument $Argument
+        $trigger   = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(10)
+        $principal = New-ScheduledTaskPrincipal -UserId ('{0}\{1}' -f $env:USERDOMAIN, $env:USERNAME) -LogonType Interactive -RunLevel Limited
+        $settings  = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Seconds $TimeoutSeconds)
+        Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
+        Start-ScheduledTask -TaskName $TaskName
+        return 'task'
+    } catch {
+        $errors += ('计划任务(cmdlet)：' + $_.Exception.Message)
+        try { Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue } catch { }
+    }
+
+    try {
+        $tr = '"{0}" {1}' -f $PsExe, $Argument
+        & schtasks.exe /Create /TN $TaskName /TR $tr /SC ONCE /ST 23:59 /F 2>&1 | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw ('schtasks /Create 退出码 {0}' -f $LASTEXITCODE) }
+        & schtasks.exe /Run /TN $TaskName 2>&1 | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw ('schtasks /Run 退出码 {0}' -f $LASTEXITCODE) }
+        return 'schtasks'
+    } catch {
+        $errors += ('计划任务(schtasks)：' + $_.Exception.Message)
+        try { & schtasks.exe /Delete /TN $TaskName /F 2>&1 | Out-Null } catch { }
+    }
+
+    try {
+        $cmdline = '"{0}" {1}' -f $PsExe, $Argument
+        $created = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = $cmdline }
+        if ($null -eq $created -or $created.ReturnValue -ne 0) {
+            $code = $(if ($null -eq $created) { 'null' } else { [string]$created.ReturnValue })
+            throw ('Win32_Process.Create 返回 {0}' -f $code)
+        }
+        return 'wmi'
+    } catch {
+        $errors += ('WMI：' + $_.Exception.Message)
+    }
+
+    throw ('无法创建独立进程（三种方式都不通）：' + ($errors -join '；'))
+}
+
 # ---------- Detach：把活交给一个独立进程 ----------
 if (-not $JobFile) {
     if ($DryRun) {
         Write-Host '[DryRun] 只演练，不会关闭进程，也不会执行命令。'
+        $planD = Read-LaunchPlan
+        $planProblemD = Test-LaunchPlan -Plan $planD
+        if ($planProblemD -ne '') {
+            Write-Host ('  启动计划：不可用（{0}）—— 真跑时会在关进程之前中止' -f $planProblemD)
+        } else {
+            Write-Host ('  启动计划：{0}（mode={1}，exe={2}）' -f $PlanPath, $planD.mode, $planD.exe)
+        }
         if ($Mode -eq 'web') {
             $listen = @(Get-NetTCPConnection -LocalPort $WebPort -State Listen -ErrorAction SilentlyContinue)
             $owner = $(if ($listen.Count -gt 0) { [string]$listen[0].OwningProcess } else { '无' })
@@ -136,7 +248,7 @@ if (-not $JobFile) {
         if ([string]::IsNullOrWhiteSpace($Command)) {
             Write-Host '  之后不执行任何命令（纯重启）'
         } else {
-            Write-Host ('  再等 {0} 秒后在工作目录 {1} 执行：{2}' -f $SettleSec, $WorkDir, $Command)
+            Write-Host ('  再等 {0} 秒后在工作目录 {1} 执行：{2}' -f $SettleSec, $(if ([string]::IsNullOrWhiteSpace($WorkDir)) { '（启动计划里的 cwd）' } else { $WorkDir }), $Command)
             Write-Host ('  命令超时：{0} 秒（超时就中止，照样启动）' -f $CommandTimeoutSec)
         }
         Write-Host ('  之后重启 DSH：{0}' -f (-not $NoStart))
@@ -163,34 +275,42 @@ if (-not $JobFile) {
             Mode             = $Mode
             WebPort          = $WebPort
             OwnerPid         = $OwnerPid
+            PlanPath         = $PlanPath
             Stamp            = $stamp
             TaskName         = $taskName
         }
         Write-JsonFile -Path $tmpJson -Object $job
 
-        # 用计划任务拉起独立进程：WMI 的 Win32_Process.Create 在这里创建出来的进程会立刻退出
-        # （实测连第一行日志都写不出来），计划任务则由 Task Scheduler 在用户交互会话里启动，可靠。
         $psExe = (Get-Process -Id $PID).Path
         if (-not $psExe) { $psExe = 'C:\Program Files\PowerShell\7\pwsh.exe' }
         $argument = '-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "{0}" -JobFile "{1}"' -f $PSCommandPath, $tmpJson
 
-        try {
-            $action    = New-ScheduledTaskAction -Execute $psExe -Argument $argument
-            $trigger   = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(10)
-            $principal = New-ScheduledTaskPrincipal -UserId ('{0}\{1}' -f $env:USERDOMAIN, $env:USERNAME) -LogonType Interactive -RunLevel Limited
-            $settings  = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Seconds ($CommandTimeoutSec + 300))
-            Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
-            Start-ScheduledTask -TaskName $taskName
-        } catch {
-            try { Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue } catch { }
-            throw ('注册计划任务失败：' + $_.Exception.Message)
+        $detachKind = Start-DetachedProcess -PsExe $psExe -Argument $argument -TaskName $taskName -TimeoutSeconds ($CommandTimeoutSec + 300)
+
+        # 把「走的哪条路」写回任务文件：子进程据此决定要不要清理计划任务。
+        # 走到这里子进程刚被创建，还来不及读文件，重写是安全的。
+        $job | Add-Member -NotePropertyName DetachKind -NotePropertyValue $detachKind -Force
+        Write-JsonFile -Path $tmpJson -Object $job
+
+        # 独立进程要能写出自己的第一行日志，才算真的活着（WMI 那条路没有控制台，
+        # 出问题的唯一表现就是「什么都没发生」）。
+        $childLog = Join-Path (Join-Path $PSScriptRoot 'logs') ('restart-' + $stamp + '.log')
+        $waited = 0
+        while ($waited -lt 20 -and -not (Test-Path -LiteralPath $childLog)) {
+            Start-Sleep -Milliseconds 500
+            $waited += 1
+        }
+        if (-not (Test-Path -LiteralPath $childLog)) {
+            Write-Host ('[警告] 独立进程（{0}）10 秒内没有写出日志，可能没起来：{1}' -f $detachKind, $childLog)
+            Write-Host '        DSH 没有被关闭。'
+            return
         }
 
-        Write-Host ('已注册计划任务「{0}」并在后台启动：' -f $taskName)
+        Write-Host ('已用「{0}」拉起独立进程：' -f $detachKind)
         Write-Host ('  {0} 秒后关闭 DSH' -f $GraceSec)
         Write-Host ('  然后执行：{0}' -f $Command)
         Write-Host ('  之后重启 DSH：{0}' -f (-not $NoStart))
-        Write-Host '  日志在 dsh-tools\logs\ 下'
+        Write-Host ('  日志：{0}' -f $childLog)
         return
     }
 }
@@ -210,11 +330,14 @@ if ($JobFile) {
     if ($null -ne $job.Mode) { $Mode = [string]$job.Mode }
     if ($null -ne $job.WebPort) { $WebPort = [int]$job.WebPort }
     if ($null -ne $job.OwnerPid) { $OwnerPid = [int]$job.OwnerPid }
+    if ($null -ne $job.PlanPath) { $PlanPath = [string]$job.PlanPath }
     $stamp     = $job.Stamp
     $taskName  = $job.TaskName
+    $detachKind = [string]$job.DetachKind
 } else {
     $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
     $taskName = $null
+    $detachKind = ''
 }
 
 $logDir = Join-Path $PSScriptRoot 'logs'
@@ -287,19 +410,51 @@ function Set-WakePhase {
 
 Write-Log '=== 重启流程开始 ==='
 Write-Log ('执行身份：{0}' -f $env:USERNAME)
-if ($Mode -eq 'web') {
-    Write-Log ('模式：web（dsh --profile web，端口 {0}）' -f $WebPort)
-} else {
-    Write-Log '模式：desktop（Electron 桌面端）'
-}
+Write-Log ('载体（判据见下）：{0}' -f $Mode)
 if ([string]::IsNullOrWhiteSpace($Command)) {
     Write-Log '命令：（无，纯重启）'
 } else {
     Write-Log ('命令：{0}' -f $Command)
     Write-Log ('命令超时：{0} 秒（超时即中止，照样启动 DSH）' -f $CommandTimeoutSec)
 }
-Write-Log ('工作目录：{0}' -f $WorkDir)
+Write-Log ('工作目录：{0}' -f $(if ([string]::IsNullOrWhiteSpace($WorkDir)) { '（启动计划里的 cwd）' } else { $WorkDir }))
 Write-Log ('计划：等 {0} 秒 → 关闭 DSH → 等 {1} 秒 → 执行命令 → 重启={2}' -f $GraceSec, $SettleSec, (-not $NoStart))
+
+# ---------- 计划门：动手之前先确认“能再拉起来” ----------
+#
+# 这一步刻意放在关闭进程**之前**。反过来的失败（先杀、再发现起不来）是这个插件
+# 最伤人的形态：服务没了，用户只能自己去开，而他已经不知道当初是怎么开的了。
+$plan = Read-LaunchPlan
+$planProblem = Test-LaunchPlan -Plan $plan
+if (-not $NoStart) {
+    if ($planProblem -ne '') {
+        Write-Log ('启动计划不可用（{0}），不关闭任何进程' -f $planProblem)
+        Set-WakePhase -Phase 'failed' -Error ('启动计划不可用：' + $planProblem)
+        throw ('启动计划不可用（{0}）：拒绝在没有可用启动计划的情况下关闭 DSH。见插件包 SETUP.md。' -f $planProblem)
+    }
+    # 以计划为准：载体、进程名、端口都从计划来，不再用「窗口 / 端口」猜。
+    # 猜错载体在两种情况下会连带杀掉别人：桌面端和网页端同时跑的时候。
+    switch ([string]$plan.mode) {
+        'web' {
+            $Mode = 'web'
+            if ([int]$plan.port -gt 0) { $WebPort = [int]$plan.port }
+        }
+        'desktop' {
+            $Mode = 'desktop'
+            $ProcName = [System.IO.Path]::GetFileNameWithoutExtension([string]$plan.exe)
+        }
+        default {
+            # custom：不知道命令会拉起什么。有端口就按网页端等/杀，没有就按桌面端。
+            if ([int]$plan.port -gt 0) { $Mode = 'web'; $WebPort = [int]$plan.port } else { $Mode = 'desktop' }
+        }
+    }
+    Write-Log ('启动计划：{0}（mode={1} 进程名={2} 端口={3}）' -f $PlanPath, $Mode, $ProcName, $WebPort)
+    # 命令的工作目录也跟着计划走：计划里的 cwd 就是宿主当时所在的项目目录。
+    if ([string]::IsNullOrWhiteSpace($WorkDir) -and -not [string]::IsNullOrWhiteSpace([string]$plan.cwd)) {
+        $WorkDir = [string]$plan.cwd
+    }
+}
+if ([string]::IsNullOrWhiteSpace($WorkDir)) { $WorkDir = $PSScriptRoot }
 
 # 看一眼插件有没有留下唤醒请求（请求由插件写，这里只报告，不改）
 $pendingWake = Read-WakeFile
@@ -329,11 +484,15 @@ if ($Mode -eq 'web') {
         Write-Log ('按 OwnerPid {0} 定位网页端进程' -f $OwnerPid)
     }
     try {
-        $conns = @(Get-NetTCPConnection -LocalPort $WebPort -State Listen -ErrorAction SilentlyContinue)
-        foreach ($c in $conns) {
-            if ($c.OwningProcess -gt 0 -and -not $webPids.Contains([int]$c.OwningProcess)) {
-                $webPids.Add([int]$c.OwningProcess)
+        if ($WebPort -gt 0) {
+            $conns = @(Get-NetTCPConnection -LocalPort $WebPort -State Listen -ErrorAction SilentlyContinue)
+            foreach ($c in $conns) {
+                if ($c.OwningProcess -gt 0 -and -not $webPids.Contains([int]$c.OwningProcess)) {
+                    $webPids.Add([int]$c.OwningProcess)
+                }
             }
+        } else {
+            Write-Log '计划里没有端口，跳过端口定位（只按 OwnerPid / server.json 定位）'
         }
     } catch {
         Write-Log ('查端口占用失败：{0}' -f $_.Exception.Message)
@@ -363,17 +522,21 @@ if ($Mode -eq 'web') {
         }
     }
 
-    $deadline = (Get-Date).AddSeconds(45)
-    while ((Get-Date) -lt $deadline) {
-        Start-Sleep -Milliseconds 500
+    if ($WebPort -gt 0) {
+        $deadline = (Get-Date).AddSeconds(45)
+        while ((Get-Date) -lt $deadline) {
+            Start-Sleep -Milliseconds 500
+            $still = @(Get-NetTCPConnection -LocalPort $WebPort -State Listen -ErrorAction SilentlyContinue)
+            if ($still.Count -eq 0) { break }
+        }
         $still = @(Get-NetTCPConnection -LocalPort $WebPort -State Listen -ErrorAction SilentlyContinue)
-        if ($still.Count -eq 0) { break }
-    }
-    $still = @(Get-NetTCPConnection -LocalPort $WebPort -State Listen -ErrorAction SilentlyContinue)
-    if ($still.Count -gt 0) {
-        Write-Log ('警告：端口 {0} 仍被占用（PID {1}），命令可能撞端口' -f $WebPort, $still[0].OwningProcess)
+        if ($still.Count -gt 0) {
+            Write-Log ('警告：端口 {0} 仍被占用（PID {1}），命令可能撞端口' -f $WebPort, $still[0].OwningProcess)
+        } else {
+            Write-Log '网页端已完全退出'
+        }
     } else {
-        Write-Log '网页端已完全退出'
+        Write-Log '计划里没有端口，跳过端口释放等待'
     }
 } else {
     $procs = @(Get-Process -Name $ProcName -ErrorAction SilentlyContinue)
@@ -503,12 +666,24 @@ if (-not $NoStart) {
     if (Test-Path -LiteralPath $StartScript) {
         Write-Log '重新启动 DSH'
         try {
-            if ($Mode -eq 'web') {
+            # 用哈希表 splat：数组 splat 会按位置绑定，'180' 会被塞给 -Mode（它的
+            # ValidateSet 只有 desktop/web），实测报「-TimeoutSec 不属于集合」。
+            $startArgs = @{ TimeoutSec = 180 }
+            if ($plan) {
+                # 有计划就把计划交给启动脚本：exe / 参数 / cwd / 端口全在里面，不用再传 -Mode。
+                $startArgs['PlanPath'] = $PlanPath
+            } elseif ($Mode -eq 'web') {
                 # web 模式没有 CDP，AutoSay 交回插件（Host 直投）
-                $startResult = & $StartScript -Mode 'web' -WebPort $WebPort -TimeoutSec 180
+                $startArgs['Mode'] = 'web'
+                $startArgs['WebPort'] = $WebPort
             } else {
-                $startResult = & $StartScript -Mode 'desktop' -TimeoutSec 180 -AutoSay $autoSayForStart -DebugPort $DebugPort
+                $startArgs['Mode'] = 'desktop'
             }
+            if (-not [string]::IsNullOrWhiteSpace($autoSayForStart)) {
+                $startArgs['AutoSay'] = $autoSayForStart
+                $startArgs['DebugPort'] = $DebugPort
+            }
+            $startResult = & $StartScript @startArgs
             Write-Log ('启动脚本返回：{0}' -f $startResult)
             if ([string]$startResult -eq 'ready') {
                 Set-WakePhase -Phase 'ready'
@@ -528,7 +703,7 @@ if (-not $NoStart) {
     Set-WakePhase -Phase 'failed' -Error '按 -NoStart 要求没有重新启动'
 }
 
-if ($taskName) {
+if ($taskName -and $detachKind -ne 'wmi') {
     try {
         Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
         Write-Log ('已清理计划任务：{0}' -f $taskName)

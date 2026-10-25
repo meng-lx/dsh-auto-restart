@@ -1,7 +1,8 @@
 # dsh-auto-restart
 
-> **网页端暂未验证。** 桌面端（Electron）已完整实测；网页端（`dsh web`）代码两侧都已适配，
-> 但还没有在真机上跑过。计划在**本周末内**完成验证并更新本文档。
+**已适配官方桌面端与官方网页端（`dsh web`）**，两种载体都跑通过真机重启。
+第三方载体（非官方 Electron 壳、`UtilityProcess` 里跑 CLI、自定义启动方式）不在默认支持
+范围内：插件检测出差异后不会贸然动手，由 agent 照 `SETUP.md` 征得你同意，再写一次启动计划。
 
 等**整个 DSH 都空闲下来**再安全地重启它，重启完成后自动回到原会话说一句话。
 
@@ -10,7 +11,7 @@ PowerShell 脚本。两边通过一个交接文件通信，谁也不猜对方的
 
 ## 前置条件
 
-- DeepSeek Harness（桌面端或网页端）
+- DeepSeek Harness **官方桌面端**，或**官方网页端**（`dsh web`）
 - Windows
 
 重启动作由包里的 PowerShell 脚本完成。插件只在倒计时结束后调用它，
@@ -113,12 +114,13 @@ PowerShell 脚本。两边通过一个交接文件通信，谁也不猜对方的
 
 | 文件 | 干什么 |
 | --- | --- |
-| `index.js` | Host 半边：工具、空闲判定、倒计时状态机、拉起脚本、状态路由 |
+| `index.js` | Host 半边：工具、空闲判定、倒计时状态机、生成启动计划、拉起脚本、状态路由 |
+| `lib/launch-plan.js` | 启动计划：从宿主自述（argv/execPath/cwd/origin）算出「怎么再起来一次」，并校验 |
 | `client.js` | Client 半边：`shell.overlay` 上的倒计时页与终止页，`settings.section` 里的设置页 |
-| `scripts/Restart-DSH.ps1` | 真正动手：关 DSH → 跑命令 → 启动 DSH → 补交接状态 |
-| `scripts/Start-DSH.ps1` | 被上一个脚本调用：按 desktop / web 启动，等就绪 |
+| `scripts/Restart-DSH.ps1` | 真正动手：先验计划 → 关 DSH → 跑命令 → 照计划启动 → 补交接状态 |
+| `scripts/Start-DSH.ps1` | 被上一个脚本调用：照计划启动（exe/参数/cwd/端口/环境变量），等就绪 |
 | `scripts/say.js` | 只在 `wakeMode: 'script'` 时用：CDP 往输入框注入 |
-| `test/idle-check.mjs` | 离线单测，`node test/idle-check.mjs`，不需要 DSH |
+| `SETUP.md` | 给 agent 的说明书：默认覆盖不到的环境怎么一次性配好 |
 | `cordis.patch.yml` | bundle patch，把本包插进 profile 的 cordis 树 |
 | `install.ps1` | 把插件装进 profile（`-Profile web\|desktop\|both`） |
 | `locale/*.json`、`icon.svg` | 插件市场与设置页里显示的标题、描述、图标 |
@@ -129,7 +131,8 @@ PowerShell 脚本。两边通过一个交接文件通信，谁也不猜对方的
 
 | 路径 | 内容 |
 | --- | --- |
-| `settings.json` | 设置页的五个默认值 |
+| `settings.json` | 设置页的五个默认值 + 两个适配兜底（`launchCommand` / `allowAutoRestart`） |
+| `launch-plan.json` | 启动计划，每次重启前重写；脚本只照它执行 |
 | `wake-request.json` | 交接文件，只在一次重启流程中存在，投递完即删 |
 | `last-run.json` | 上一次脚本运行的结果（命令、退出码、是否超时、时间） |
 | `logs/plugin.log` | 插件自己的日志（加载、倒计时、投递、失败原因） |
@@ -156,16 +159,22 @@ PowerShell 脚本。两边通过一个交接文件通信，谁也不猜对方的
 
 ## 两种载体
 
-插件的 Host 半边不需要知道自己是哪一边：拉起脚本时不传 `-Mode`（默认 `auto`），
-脚本自己按「有没有可见主窗口」判断；插件只额外传一个 `-WebPort <当前端口>`，
-网页端重启后要绑回同一个端口，已经开着的标签页才连得回来。
+宿主不需要知道自己是哪一边。每次动手前，它把自己**实际是怎么跑起来的**写成
+`launch-plan.json`（`process.execPath` + `process.argv` + `cwd` + `webServer.getOrigin()`），
+脚本照计划执行：该重放什么 exe、带什么参数、在哪个目录、绑哪个端口、给什么环境变量。
 
-真正的差别都在脚本里：
+「dsh 装在哪」因此不再是一个需要回答的问题：shim（`dsh.cmd` / `dsh.ps1`）只是转发，
+`argv[1]` 已经是 `…/@deepseek-ai/dsh/lib/bin.js` 的绝对路径，原样重放即可。
+
+**计划不可用就不杀进程**：校验（exe/入口存在、mode 认识、端口像样）发生在关进程之前，
+校验不过这次重启直接作废 —— 先杀再发现起不来，是这类工具最伤人的失败形态。
+
+真正的差别都在计划里：
 
 | | desktop | web |
 |---|---|---|
-| 怎么关 | 按进程名 `DeepSeek Harness` 全杀 | 按谁占着这个端口找 PID，`taskkill /T /F` |
-| 怎么起 | `DeepSeek Harness.exe` | `dsh --profile web --no-open` |
+| 怎么关 | 按进程名（取自计划里的 exe 名）全杀 | 按谁占着计划里的端口找 PID，`taskkill /T /F` |
+| 怎么起 | 重放外壳 exe（删掉 `ELECTRON_RUN_AS_NODE`） | 重放 `node <bin.js> web …` |
 | 就绪判据 | 主窗口出现 | 端口有响应（401 也算，说明服务在） |
 
 **唤醒链路两种载体完全一样**：交接文件 + `sessionController.prompt()` 直投。
@@ -176,7 +185,14 @@ PowerShell 脚本。两边通过一个交接文件通信，谁也不猜对方的
 
 ## 已知限制
 
-- 网页端尚未实测（插件、脚本两侧都按网页端写好了，缺一次真机验证）；
-- 桌面端的启动路径依赖 `%LOCALAPPDATA%\Programs\DeepSeek Harness`，DSH 装在别处需要改
-  `scripts/Start-DSH.ps1`；
+- 官方桌面端与 `dsh web` 都在真机上完整跑通过；第三方 Electron 壳（`UtilityProcess` 里跑 CLI）
+  未经实测，插件判定不出「怎么原样再起来一次」时会拒绝动手，而不是猜着杀进程；
+- 默认只覆盖**官方桌面端**与 `dsh web` 两种形态。其余环境由 agent 照 `SETUP.md` 征得你同意后
+  配一次 `launchCommand`（一条完整命令），插件不再猜安装位置；
+- 容器 / systemd / Windows 服务等「杀不死」的托管形态不支持，检测不出时会由用户在
+  `allowAutoRestart=false` 上明确关掉，而不是把 DSH 停在起不来的状态；
+- 真正动手那一刻需要一个「不在 DSH 进程树里」的子进程，否则 `taskkill /T` 会把它一起带走。
+  插件按 **计划任务 → schtasks → WMI（Win32_Process.Create）** 三级阶梯尝试，实测某些
+  机器上计划任务被策略拒绝（`Access is denied.`），此时自动落到 WMI；三级都不通会直接
+  报错并**保持 DSH 运行**，不会出现「关掉了但起不来」；
 - 桌面端重启后窗口位置、大小由 DSH 自己决定，插件不介入。
