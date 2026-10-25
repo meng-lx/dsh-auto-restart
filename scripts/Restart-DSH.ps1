@@ -179,6 +179,23 @@ function Test-LaunchPlan {
 #            taskkill /T 带不走它；仍然落在调用者的会话里（窗口能正常出现）
 #
 # 三条都不通就抛错——在杀进程**之前**抛，宁可这次不重启。
+# 用 wscript 包一层再启动：计划任务在交互式会话里直接 Execute powershell.exe
+# 会先给子进程分配一个控制台，即使 -WindowStyle Hidden 也要先闪一下黑框。
+# wscript.exe 自己不带窗口，由它用 Run(..., 0, False) 起子进程，连控制台都不建。
+# 生成的 .vbs 只有一行，落在 TEMP 里，任务结束时由子进程删掉。
+function New-HiddenLauncher {
+    param(
+        [Parameter(Mandatory = $true)][string]$PsExe,
+        [Parameter(Mandatory = $true)][string]$Argument,
+        [Parameter(Mandatory = $true)][string]$Stamp
+    )
+    $vbs = Join-Path $env:TEMP ('dsh-restart-launch-' + $Stamp + '.vbs')
+    $cmd = '"{0}" {1}' -f $PsExe, $Argument
+    $line = 'CreateObject("WScript.Shell").Run "' + ($cmd -replace '"', '""') + '", 0, False'
+    Set-Content -LiteralPath $vbs -Value $line -Encoding Unicode
+    return $vbs
+}
+
 function Start-DetachedProcess {
     param(
         [Parameter(Mandatory = $true)][string]$PsExe,
@@ -294,11 +311,17 @@ if (-not $JobFile) {
         if (-not $psExe) { $psExe = 'C:\Program Files\PowerShell\7\pwsh.exe' }
         $argument = '-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "{0}" -JobFile "{1}"' -f $PSCommandPath, $tmpJson
 
-        $detachKind = Start-DetachedProcess -PsExe $psExe -Argument $argument -TaskName $taskName -TimeoutSeconds ($CommandTimeoutSec + 300)
+        # 交给 wscript 起，避免计划任务那一下黑框。
+        $vbsPath = New-HiddenLauncher -PsExe $psExe -Argument $argument -Stamp $stamp
+        $wscriptExe = Join-Path $env:WINDIR 'System32\wscript.exe'
+        if (-not (Test-Path -LiteralPath $wscriptExe)) { $wscriptExe = 'wscript.exe' }
 
-        # 把「走的哪条路」写回任务文件：子进程据此决定要不要清理计划任务。
+        $detachKind = Start-DetachedProcess -PsExe $wscriptExe -Argument ('//nologo "{0}"' -f $vbsPath) -TaskName $taskName -TimeoutSeconds ($CommandTimeoutSec + 300)
+
+        # 把「走的哪条路」和启动器路径写回任务文件：子进程据此决定要不要清理计划任务。
         # 走到这里子进程刚被创建，还来不及读文件，重写是安全的。
         $job | Add-Member -NotePropertyName DetachKind -NotePropertyValue $detachKind -Force
+        $job | Add-Member -NotePropertyName VbsPath -NotePropertyValue $vbsPath -Force
         Write-JsonFile -Path $tmpJson -Object $job
 
         # 独立进程要能写出自己的第一行日志，才算真的活着（WMI 那条路没有控制台，
@@ -749,6 +772,9 @@ if ($taskName -and $detachKind -ne 'wmi') {
     try {
         Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
         Write-Log ('已清理计划任务：{0}' -f $taskName)
+        if ($job -and $job.VbsPath) {
+            try { Remove-Item -LiteralPath $job.VbsPath -Force -ErrorAction SilentlyContinue } catch { }
+        }
     } catch {
         Write-Log ('清理计划任务失败：{0}' -f $_.Exception.Message)
     }

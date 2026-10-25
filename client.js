@@ -236,6 +236,11 @@ window.__ModuleLoader__.load({
       // 已经对这次倒计时发过取消指令 → 避免每次 mousemove 都 POST 一次
       var cancelledBox = React.useRef(false)
 
+      // 点了取消之后的一小段时间里，服务端那份快照可能还是 counting
+      // （/cancel 还在路上）。这段时间不去采信它，否则画面会闪回倒计时页
+      // 再跳到终止页 —— 就是「点一下闪一下」的老毛病。
+      var suppressBox = React.useRef(0)
+
       // 已经对这次倒计时报过到 → 只报一次，别把 /viewer 打成轮询
       var reportedBox = React.useRef(false)
 
@@ -272,6 +277,9 @@ window.__ModuleLoader__.load({
             readState()
               .then(function (next) {
                 if (stopped) return
+                // 本地刚切到终止页、还在等 /cancel 落地的这段时间，
+                // 服务端的旧快照（仍是 counting）不许把页面拉回倒计时。
+                if (next && next.phase === 'counting' && Date.now() < suppressBox.current) return
                 if (next) setState(next)
                 // 阶段切换时重置「已取消」标记
                 if (!next || next.phase !== 'counting') cancelledBox.current = false
@@ -332,6 +340,7 @@ window.__ModuleLoader__.load({
             // 直接切到「已取消」页，不要先回 idle 再等 Host 回话：
             // 中间那一帧 idle 什么都不画，屏幕上就是「倒计时闪一下消失、终止页再冒出来」。
             // 本地先摆好这一页，Host 的 /cancel 回来只是把同一页的字段对齐，画面不重建。
+            suppressBox.current = Date.now() + 1500
             setState(function (prev) {
               if (!prev || prev.phase !== 'counting') return prev
               var next = Object.assign({}, prev)
