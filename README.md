@@ -117,7 +117,6 @@ PowerShell 脚本。两边通过一个交接文件通信，谁也不猜对方的
 | `GET /probe` | 现扫一遍宿主：此刻谁在忙、各 agent 的状态 |
 | `GET` / `POST /settings` | 读 / 写五个默认值 |
 | `GET /last-run` | 上一次脚本运行的结果 |
-| `POST /restart` | 非工具入口（body: `{ sessionId, countdownSec?, autoSay?, command?, wakeMode? }`） |
 | `POST /cancel` | 取消倒计时（body: `{ reason }`） |
 | `POST /dismiss` | 关掉终止提示页 |
 

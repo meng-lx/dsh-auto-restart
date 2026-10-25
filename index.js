@@ -56,8 +56,8 @@ const API_PATH = '/auto-restart/api'
  * UI 端点的门禁：本机回环 + 自定义请求头 + 同源。
  *
  * 宿主的 webServer **不做** Origin / 鉴权检查（实测：带外源 Origin 的 POST 照样进得来），
- * 而 `/restart` 是能把整台 DSH 关掉的操作，不设门就等于本机随便哪个进程、随便哪个网页
- * 都能触发重启。三层：
+ * 而这个前缀下全是会改动状态的操作（取消倒计时、关提示页、写设置），门不做就等于
+ * 本机随便哪个网页都能拨弄插件的状态机。三层：
  *   ① 带反向代理头的请求直接拒：说明来源已经过中间层，不可信；
  *   ② 来源必须是回环地址；
  *   ③ 必须带 `x-auto-restart: 1` —— 跨源请求带自定义头会先触发浏览器预检，而宿主
@@ -110,6 +110,15 @@ const DEFAULT_COUNTDOWN = 10
 /** 倒计时允许的范围。 */
 const MIN_COUNTDOWN = 3
 const MAX_COUNTDOWN = 600
+
+/**
+ * 本机开发用的 `POST /restart` 是否开启。
+ *
+ * 发布版没有这条路由：能让外部凭空重启一次 DSH 的入口，不该出现在交给别人的代码里。
+ * 但开发时需要它——`restart_dsh` 有过「在工具表里、却进不了模型看到的定义」的毛病，
+ * 那时只能从 HTTP 触发。所以留一个只认环境变量的开关，默认关闭。
+ */
+const LOCAL_RESTART_ENABLED = process.env.DSH_AUTO_RESTART_LOCAL_RESTART === '1'
 
 /**
  * 倒计时末尾多给的缓冲（毫秒）。
@@ -1729,9 +1738,10 @@ export function apply(ctx, config = {}) {
               return
             }
 
-            if (route === '/restart' && req.method === 'POST') {
-              // 和工具完全同一条路径：只是把「谁发起的」从 exec.agent 换成请求体里的
-              // sessionId。网页端没有 agent 上下文时，这是唯一能走完整流程的入口。
+            if (route === '/restart' && req.method === 'POST' && LOCAL_RESTART_ENABLED) {
+              // 只在本机开发时存在：设了 DSH_AUTO_RESTART_LOCAL_RESTART=1 才有这条路由。
+              // 发布版不暴露它 —— 触发重启的唯一产品入口是 restart_dsh 工具。
+              // 保留它是为了在「工具暂时不可见」时还能验证倒计时与重启链路。
               const body = await readJsonBody(req)
               const payload = body && typeof body === 'object' ? body : {}
               const targetSession = typeof payload.sessionId === 'string' ? payload.sessionId.trim() : ''

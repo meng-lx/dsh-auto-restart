@@ -618,12 +618,18 @@ Host/Client 主文件放包根（`index.js` / `client.js`），只有启动计�
 ### 19.1 状态路由加门禁
 
 **问题**：`webServer.register` 收的是一个不处理 `Upgrade` 的简单 request handler，
-没有 origin 门禁。而 `POST /auto-restart/api/restart` 能让整台机器的 DSH 重启一次。
-也就是说：你在浏览器里随便打开的任何网页，只要往 `http://127.0.0.1:<port>/auto-restart/api/restart`
-发一个 POST，就能把 DSH 关掉。它不需要读任何响应，是典型的 CSRF 破坏型请求。
+没有 origin 门禁。而这个前缀下全是会改动状态的操作——取消倒计时、关提示页、写设置。
+也就是说：你在浏览器里随便打开的任何网页，只要往 `http://127.0.0.1:<port>/auto-restart/api/cancel`
+发一个 POST，就能把一次即将执行的重启取消掉，或者把设置改了。
 
 对照：官方服务 `app://` 自带 `Origin` 校验、`WebServer.handleUpgrade` 拒绝任意跨界升级；
 第三方插件拿到的是「降级到简单 handler」那个口子。
+
+**顺带删掉的**：`POST /restart`（直接从 HTTP 触发一次完整重启）。
+它当初是为了绕开「`restart_dsh` 在工具表里、却进不了模型看到的工具定义」而加的测试通道，
+不是产品功能。1.2 起只认环境变量 `DSH_AUTO_RESTART_LOCAL_RESTART=1`，默认不存在。
+理由：**能让外部凭空重启一次 DSH 的入口，不该出现在交给别人的代码里**。
+而这个插件坚持「agent 全自动」——手动重启是别的插件该做的事，加进来只会多一份要维护的攻击面。
 
 **改法**（`index.js` 的 `rejectUntrusted()`，注册时挂上）：
 1. 来源地址必须是回环，且没有 `X-Forwarded-For` / `X-Real-IP`（有就说明前面有代理，
