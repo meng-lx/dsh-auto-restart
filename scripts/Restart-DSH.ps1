@@ -51,6 +51,9 @@ param(
     [string]$WorkDir = '',
     [int]$GraceSec = 0,
     [int]$SettleSec = 8,
+    # 关窗口之后先等宿主自己退出多久（秒），等不到才强杀。
+    # 留给宿主把会话日志落盘 —— 直接 taskkill /F 会切断正在写的日志。
+    [int]$HostWaitSec = 8,
     [switch]$NoStart,
     [switch]$Detach,
     [switch]$DryRun,
@@ -245,6 +248,11 @@ if (-not $JobFile) {
             Write-Host ('  模式：desktop，当前 DSH 进程数：{0}' -f $count)
         }
         Write-Host ('  等 {0} 秒后关闭 DSH' -f $GraceSec)
+        if ($HostWaitSec -gt 0) {
+            Write-Host ('  关窗口后先等宿主自己退出：最多 {0} 秒（等不到才强杀）' -f $HostWaitSec)
+        } else {
+            Write-Host '  关窗口后立即强杀（-HostWaitSec 0）'
+        }
         if ([string]::IsNullOrWhiteSpace($Command)) {
             Write-Host '  之后不执行任何命令（纯重启）'
         } else {
@@ -268,6 +276,7 @@ if (-not $JobFile) {
             WorkDir          = $WorkDir
             GraceSec         = $GraceSec
             SettleSec        = $SettleSec
+            HostWaitSec      = $HostWaitSec
             NoStart          = [bool]$NoStart
             AutoSay          = $AutoSay
             DebugPort        = $DebugPort
@@ -323,6 +332,7 @@ if ($JobFile) {
     $WorkDir   = $job.WorkDir
     $GraceSec  = [int]$job.GraceSec
     $SettleSec = [int]$job.SettleSec
+    if ($null -ne $job.HostWaitSec) { $HostWaitSec = [int]$job.HostWaitSec }
     $NoStart   = [bool]$job.NoStart
     $AutoSay   = $job.AutoSay
     $DebugPort = [int]$job.DebugPort
@@ -540,28 +550,60 @@ if ($Mode -eq 'web') {
     }
 } else {
     $procs = @(Get-Process -Name $ProcName -ErrorAction SilentlyContinue)
-    Write-Log ('发现 {0} 个 DSH 进程，开始关闭' -f $procs.Count)
+    Write-Log ('发现 {0} 个 DSH 进程，先请求它自己收尾' -f $procs.Count)
+
+    # 只向主进程发关闭请求：不带 /F 的 taskkill 走的是 WM_CLOSE，Electron 会跑
+    # before-quit，会话日志才有机会落盘。直接 Stop-Process -Force 是硬切，
+    # 正在写的那几行就没了 —— 这也是「任务已停止」那条痕迹的来源之一。
+    $mainPid = 0
     foreach ($p in $procs) {
         try {
-            Write-Log ('  结束 PID {0}（{1} MB）' -f $p.Id, [int]($p.WorkingSet64 / 1MB))
-            Stop-Process -Id $p.Id -Force -ErrorAction Stop
-        } catch {
-            Write-Log ('  结束 PID {0} 失败：{1}' -f $p.Id, $_.Exception.Message)
-        }
+            $cmdline = (Get-CimInstance Win32_Process -Filter ('ProcessId={0}' -f $p.Id) -ErrorAction Stop).CommandLine
+        } catch { $cmdline = '' }
+        if ([string]::IsNullOrWhiteSpace($cmdline) -or $cmdline -notmatch '--type=') { $mainPid = $p.Id; break }
     }
 
-    $deadline = (Get-Date).AddSeconds(45)
-    while ((Get-Date) -lt $deadline) {
-        Start-Sleep -Milliseconds 500
-        $left = @(Get-Process -Name $ProcName -ErrorAction SilentlyContinue)
-        if ($left.Count -eq 0) { break }
+    if ($HostWaitSec -gt 0 -and $mainPid -gt 0) {
+        Write-Log ('  请求关闭主进程 PID {0}（优雅，最多等 {1} 秒）' -f $mainPid, $HostWaitSec)
+        try { & taskkill.exe /PID $mainPid 2>&1 | ForEach-Object { Write-Log ('    ' + [string]$_) } } catch { }
+        $graceDeadline = (Get-Date).AddSeconds($HostWaitSec)
+        while ((Get-Date) -lt $graceDeadline) {
+            Start-Sleep -Milliseconds 300
+            if (@(Get-Process -Name $ProcName -ErrorAction SilentlyContinue).Count -eq 0) { break }
+        }
+    } elseif ($HostWaitSec -gt 0) {
+        Write-Log '  找不到主进程，跳过优雅关闭'
     }
+
     $left = @(Get-Process -Name $ProcName -ErrorAction SilentlyContinue)
-    if ($left.Count -gt 0) {
-        Write-Log ('警告：仍有 {0} 个进程没退出，命令可能撞文件占用' -f $left.Count)
-        foreach ($p in $left) { Write-Log ('  残留 PID {0}' -f $p.Id) }
+    if ($left.Count -eq 0) {
+        Write-Log 'DSH 已自行退出（会话日志有机会落盘）'
     } else {
-        Write-Log 'DSH 已完全退出'
+        if ($HostWaitSec -gt 0) {
+            Write-Log ('优雅关闭没等到，剩 {0} 个进程，改为强制结束（会话日志可能不完整）' -f $left.Count)
+        }
+        foreach ($p in $left) {
+            try {
+                Write-Log ('  结束 PID {0}（{1} MB）' -f $p.Id, [int]($p.WorkingSet64 / 1MB))
+                Stop-Process -Id $p.Id -Force -ErrorAction Stop
+            } catch {
+                Write-Log ('  结束 PID {0} 失败：{1}' -f $p.Id, $_.Exception.Message)
+            }
+        }
+
+        $deadline = (Get-Date).AddSeconds(45)
+        while ((Get-Date) -lt $deadline) {
+            Start-Sleep -Milliseconds 500
+            $left = @(Get-Process -Name $ProcName -ErrorAction SilentlyContinue)
+            if ($left.Count -eq 0) { break }
+        }
+        $left = @(Get-Process -Name $ProcName -ErrorAction SilentlyContinue)
+        if ($left.Count -gt 0) {
+            Write-Log ('警告：仍有 {0} 个进程没退出，命令可能撞文件占用' -f $left.Count)
+            foreach ($p in $left) { Write-Log ('  残留 PID {0}' -f $p.Id) }
+        } else {
+            Write-Log 'DSH 已完全退出'
+        }
     }
 }
 

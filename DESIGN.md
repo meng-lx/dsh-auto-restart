@@ -610,3 +610,71 @@ Host/Client 主文件放包根（`index.js` / `client.js`），只有启动计�
 2. **重放 argv 会把「开浏览器」一起重放**。`dsh web` 默认开浏览器，重放后每次重启多开
    一个标签页。`buildLaunchPlan` 的 web 分支已补：命令行里没有 `--no-open` 就追加。
    这一行只对**下一次**重启生效 —— 正在跑的进程用的是启动时加载的那份模块。
+
+## 十九、1.2 为什么这么改（决策记录）
+
+三件事，都是「补一个原本就存在的洞」，不是新功能。
+
+### 19.1 状态路由加门禁
+
+**问题**：`webServer.register` 收的是一个不处理 `Upgrade` 的简单 request handler，
+没有 origin 门禁。而 `POST /auto-restart/api/restart` 能让整台机器的 DSH 重启一次。
+也就是说：你在浏览器里随便打开的任何网页，只要往 `http://127.0.0.1:<port>/auto-restart/api/restart`
+发一个 POST，就能把 DSH 关掉。它不需要读任何响应，是典型的 CSRF 破坏型请求。
+
+对照：官方服务 `app://` 自带 `Origin` 校验、`WebServer.handleUpgrade` 拒绝任意跨界升级；
+第三方插件拿到的是「降级到简单 handler」那个口子。
+
+**改法**（`index.js` 的 `rejectUntrusted()`，注册时挂上）：
+1. 来源地址必须是回环，且没有 `X-Forwarded-For` / `X-Real-IP`（有就说明前面有代理，
+   `socket.remoteAddress` 是谁已不可信）；
+2. 必须带 `X-Auto-Restart: 1`（跨站发自定义头必触发预检，预检过不了）；
+3. 带了 `Origin` 时，必须与 `Host` 同源。
+
+**定位**：只挡网页脚本。本机其它进程补个头就能调 —— 它们本来就有能力杀进程，
+这里不假装能防住，也不值得加 token 增加复杂度。
+
+### 19.2 判定项补两条：排队消息、已武装的定时提醒
+
+**问题**：`agents.list()` 里 `status === 'idle'` 不等于「这一轮真的走完了」。
+宿主 `dsh-desktop-host/lib/index.js:100` 的 `hasDesktopActiveTasks()` 已经把这件事说清楚了：
+
+```js
+function hasDesktopActiveTasks(liveAgents, jobs) {
+  return liveAgents.some((agent) => agent.status === "running"
+    || agent.inbox.nextTurn.length > 0 || agent.inbox.nextStep.length > 0)
+    || jobs.some(...)
+    || scope.hasArmedSchedules()
+}
+```
+
+队列被消费完之后状态才回到 idle，中间有一瞬间状态是 idle 但这一轮还没完。
+定时提醒同理：已武装但还没触发时，没有任何 agent 在跑，只靠 `agents` + `jobs` 判不出来。
+
+**改法**：
+- 排队消息读 `agent.inbox.nextTurn` / `nextStep`，非空即算忙（`kind: 'queued'`）。
+- 已武装的定时提醒走宿主自己的 `ctx.waterfall('workspace/session-activity', { sessionId })`，
+  返回里有 `kind === 'schedule'` 的条目即算忙（`kind: 'schedule'`）。
+  **没有**自己在插件里维护一份定时器账本：宿主已经有这个信息，自己再记一份必然会和它漂移。
+- 瀑布抛错或取不到 → 当作「没挂东西」。宁可偶尔多放行一次，也不要让重启被一个
+  取不到数据的接口永久卡死（这是「自己造成的 bug 比挡不住更严重」的取舍）。
+
+### 19.3 关窗口改成「先请求，等不到再强杀」
+
+**问题**：`Restart-DSH.ps1` 原来是直接 `taskkill /F`。对 Electron 来说等于拔电源：
+正常退出时主进程会做的收尾一概跳过。宿主自己的退出菜单用的是
+`forceCloseWindows → waitForPersistence → app.quit()`，是给持久化留了时间的。
+
+**改法**：新增 `-HostWaitSec`（默认 8 秒）。先逐个窗口发 `WM_CLOSE`
+（走宿主自己的关闭路径，它会等持久化写完），再轮询主进程是否退出；
+等不到才 `taskkill /F`。`-HostWaitSec 0` 恢复成「直接强杀」。
+`CommandTimeoutSec` 那条路径上的 `taskkill` 也改为 `WM_CLOSE` + 等 3 秒 + 强杀。
+
+**代价**：正常情况下多花 1–3 秒；换到的是不给宿主留「被腰斩」的可能。
+
+## 二十、1.2 的版本与发布
+
+- `package.json` → `1.2.0`，补 `license: MIT` + `LICENSE`（市场维护者合并时提的请求）。
+- 测试 49 → 64 项：新增 L 组（门禁七条）、M 组（排队消息）、N 组（定时提醒）、
+  O 组（瀑布抛错不误判）。
+

@@ -52,6 +52,46 @@ export const inject = ['tools']
 /** 面板/状态 API 路径（只给本插件自己的 Client 用）。 */
 const API_PATH = '/auto-restart/api'
 
+/**
+ * UI 端点的门禁：本机回环 + 自定义请求头 + 同源。
+ *
+ * 宿主的 webServer **不做** Origin / 鉴权检查（实测：带外源 Origin 的 POST 照样进得来），
+ * 而 `/restart` 是能把整台 DSH 关掉的操作，不设门就等于本机随便哪个进程、随便哪个网页
+ * 都能触发重启。三层：
+ *   ① 带反向代理头的请求直接拒：说明来源已经过中间层，不可信；
+ *   ② 来源必须是回环地址；
+ *   ③ 必须带 `x-auto-restart: 1` —— 跨源请求带自定义头会先触发浏览器预检，而宿主
+ *      不放行 CORS，所以别的网页打不进来（挡的是浏览器，不是本机的其它程序）；
+ *   ④ 带了 Origin 就必须与 Host 同源（同源 fetch 不一定带 Origin，所以是「带了才查」）。
+ */
+const REQUEST_HEADER = 'x-auto-restart'
+
+function checkRequestSource(req) {
+  const headers = (req && req.headers) || {}
+  for (const key of ['x-forwarded-for', 'x-real-ip', 'forwarded']) {
+    if (headers[key] !== undefined) {
+      return { ok: false, reason: `带了反向代理头 ${key}，来源不可信` }
+    }
+  }
+  const addr = String((req && req.socket && req.socket.remoteAddress) || '')
+  const loopback = addr === '127.0.0.1' || addr === '::1' || addr === '::ffff:127.0.0.1'
+  if (!loopback) return { ok: false, reason: `来源不是本机回环地址（${addr || '未知'}）` }
+  if (String(headers[REQUEST_HEADER] ?? '') !== '1') {
+    return { ok: false, reason: `缺少 ${REQUEST_HEADER} 请求头` }
+  }
+  const origin = String(headers.origin ?? '').trim()
+  if (origin !== '') {
+    let sameOrigin = false
+    try {
+      sameOrigin = new URL(origin).host === String(headers.host ?? '').trim()
+    } catch {
+      sameOrigin = false
+    }
+    if (sameOrigin !== true) return { ok: false, reason: `Origin 与 Host 不同源（${origin}）` }
+  }
+  return { ok: true }
+}
+
 /** 外部重启脚本。随包附带，默认取包内的 scripts/，可用 config.scriptPath 覆盖。 */
 const DEFAULT_SCRIPT = join(PACKAGE_ROOT, 'scripts', 'Restart-DSH.ps1')
 
@@ -303,15 +343,17 @@ const OWN_JOB_IDS = new Set()
  * 谁在跑都不重启」。工具已经秒回、本轮回复也发完了，它要是还在 running，
  * 说明这一轮确实没说完，该拦。
  */
-function collectBlockers(services) {
+async function collectBlockers(services) {
   const blockers = []
   let sawAgentService = false
+  const roster = []
 
   const agents = services.agents
   if (agents) {
     sawAgentService = true
     for (const agent of safeList(agents)) {
       if (!agent) continue
+      roster.push(agent)
       let status
       try {
         status = agent.status
@@ -325,6 +367,35 @@ function collectBlockers(services) {
   }
   if (!sawAgentService) {
     blockers.push({ kind: 'agent', id: '', label: '拿不到 agents 服务，无法确认空闲' })
+  }
+
+  // 排队消息：agent 看起来 idle，但信箱里压着一条，这时候动手就是把它吞了。
+  // 判据对齐宿主自己的 hasDesktopActiveTasks（dsh-desktop-host/lib/index.js:100）。
+  for (const agent of roster) {
+    let queued = 0
+    try {
+      const inbox = agent.inbox || {}
+      queued = (inbox.nextTurn?.length ?? 0) + (inbox.nextStep?.length ?? 0)
+    } catch {
+      queued = 0
+    }
+    if (queued > 0) {
+      blockers.push({ kind: 'queued', id: String(agent.id ?? ''), label: '有排队消息待处理' })
+      break
+    }
+  }
+
+  // 已武装的定时提醒：到点会真的开跑，也算「有人在等这台机器」。
+  // 宿主只在退出检查里查这个（quit-inspection），这里照抄同一条瀑布。
+  if (roster.length > 0 && typeof services.sessionActivity === 'function') {
+    for (const agent of roster) {
+      const rows = await services.sessionActivity(agent.id)
+      if (!Array.isArray(rows)) continue
+      if (rows.some((entry) => entry && entry.kind === 'schedule')) {
+        blockers.push({ kind: 'schedule', id: String(agent.id ?? ''), label: '有已武装的定时提醒' })
+        break
+      }
+    }
   }
 
   const jobs = services.jobs
@@ -1034,6 +1105,25 @@ export function apply(ctx, config = {}) {
     get webServer() {
       return getService('webServer')
     },
+    /**
+     * 某个会话上「还挂着什么」（定时提醒走这条瀑布）。
+     *
+     * 宿主自己的退出检查就是这么问的（dsh-desktop-host 的 quit-inspection），
+     * 查不到就当没有：宁可漏一条提醒，也不要因为瀑布没就绪把重启永久卡死。
+     */
+    async sessionActivity(sessionId) {
+      try {
+        if (typeof ctx.waterfall !== 'function') return []
+        const rows = await ctx.waterfall(
+          'workspace/session-activity',
+          { sessionId },
+          () => Promise.resolve([]),
+        )
+        return Array.isArray(rows) ? rows : []
+      } catch {
+        return []
+      }
+    },
   }
 
   /**
@@ -1119,7 +1209,7 @@ export function apply(ctx, config = {}) {
     // 倒计时走完了：这时候才真正判定「整台机器现在能不能停」。
     // 之所以放在这里而不是调用入口，是因为倒计时本身就是给在跑的任务的收尾窗口——
     // 调用时正忙、倒计时结束时已经跑完，就是可以重启的；反之就该放弃。
-    const blockersAtEnd = collectBlockers(services)
+    const blockersAtEnd = await collectBlockers(services)
     if (blockersAtEnd.length > 0) {
       logger.line(
         `倒计时结束时仍有 ${blockersAtEnd.length} 处在忙，放弃重启：${blockersAtEnd
@@ -1549,6 +1639,16 @@ export function apply(ctx, config = {}) {
         path: API_PATH,
         handler: (req, res) => {
           void (async () => {
+            // 门禁先过：这三层挡的是「别的网页/别的进程顺手把 DSH 关掉」。
+            const guard = checkRequestSource(req)
+            if (!guard.ok) {
+              log(`拒绝一次 API 请求：${guard.reason}`)
+              jsonResponse(res, 403, {
+                ok: false,
+                error: { code: 'forbidden', message: guard.reason },
+              })
+              return
+            }
             const url = new URL(req.url || '/', 'http://127.0.0.1')
             const route = url.pathname.slice(API_PATH.length) || '/state'
 
@@ -1569,7 +1669,7 @@ export function apply(ctx, config = {}) {
 
             if (route === '/probe' && (req.method === 'GET' || req.method === 'HEAD')) {
               // 实时扫描：state 只是状态机的记忆，这里现查一遍宿主，给调试和验证用。
-              const live = collectBlockers(services)
+              const live = await collectBlockers(services)
               const agents = []
               for (const agent of safeList(services.agents)) {
                 let status = 'unknown'

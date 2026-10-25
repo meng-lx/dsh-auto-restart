@@ -60,8 +60,20 @@ function makeCtx(services) {
         return () => {}
       },
     },
+    /** 「这个会话上还挂着什么」：默认空，测试可按需塞 schedule 条目。 */
+    waterfall(name, args) {
+      const custom = services.waterfallRows
+      return Promise.resolve(typeof custom === 'function' ? custom(name, args) : [])
+    },
     logger: { info() {}, warn() {}, error() {} },
   }
+  /** 假请求：门禁要求回环来源 + `x-auto-restart: 1`，这里照真实 Client 的样子造一个。 */
+  const fakeRequest = (method, url, headers) => ({
+    method,
+    url,
+    headers: Object.assign({ host: '127.0.0.1:12345', 'x-auto-restart': '1' }, headers || {}),
+    socket: { remoteAddress: '127.0.0.1' },
+  })
   /** 走一遍插件自己注册的 /state 路由，拿状态机的当前快照。 */
   const readState = async () => {
     if (!routeHandler) return null
@@ -73,7 +85,7 @@ function makeCtx(services) {
         body += String(chunk ?? '')
       },
     }
-    routeHandler({ method: 'GET', url: '/auto-restart/api/state' }, res)
+    routeHandler(fakeRequest('GET', '/auto-restart/api/state'), res)
     // handler 是 `void (async () => …)()` 起的，等它跑完再读 body
     await new Promise((r) => setTimeout(r, 30))
     try {
@@ -82,14 +94,14 @@ function makeCtx(services) {
       return null
     }
   }
-  return { ctx, registered, readState }
+  return { ctx, registered, readState, fakeRequest, routeHandler: () => routeHandler }
 }
 
 function loadTool(services) {
-  const { ctx, registered, readState } = makeCtx(services)
+  const { ctx, registered, readState, fakeRequest, routeHandler } = makeCtx(services)
   apply(ctx, { scriptPath: 'Z:\\不存在\\Restart-DSH.ps1' })
   if (registered.length !== 1) throw new Error(`工具没注册成功（register 调了 ${registered.length} 次）`)
-  return { tool: registered[0], readState }
+  return { tool: registered[0], readState, fakeRequest, getHandler: routeHandler }
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
@@ -347,6 +359,124 @@ const 等倒计时 = 4200
   // 非法 wakeMode 被忽略
   fs.writeFileSync(SETTINGS_FILE, JSON.stringify({ wakeMode: 'nonsense' }), 'utf8')
   check('K12 非法 wakeMode 被忽略', loadSettings().wakeMode, SETTINGS_DEFAULTS.wakeMode)
+}
+
+// ── L. 门禁：只有「本机回环 + 自定义头 + 同源」的请求放得进来 ──────────
+{
+  const { getHandler } = loadTool({
+    agents: { list: () => [{ id: 'idle-l', status: 'idle' }] },
+    jobs: { list: () => [] },
+  })
+  const handler = getHandler()
+  /** 发一个请求，返回 HTTP 状态码（看门禁放没放行）。 */
+  const status = async (req) => {
+    let code = 0
+    let body = ''
+    const res = {
+      writeHead(c) {
+        code = c
+      },
+      setHeader() {},
+      end(chunk) {
+        body += String(chunk ?? '')
+      },
+    }
+    handler(req, res)
+    await new Promise((r) => setTimeout(r, 30))
+    return { code, body }
+  }
+  const base = () => ({
+    method: 'GET',
+    url: '/auto-restart/api/state',
+    headers: { host: '127.0.0.1:12345', 'x-auto-restart': '1' },
+    socket: { remoteAddress: '127.0.0.1' },
+  })
+
+  const okReq = base()
+  const okRes = await status(okReq)
+  check('L1 正常请求放行', okRes.code, 200)
+
+  const noHeader = base()
+  delete noHeader.headers['x-auto-restart']
+  const noHeaderRes = await status(noHeader)
+  check('L2 缺自定义头 → 403', noHeaderRes.code, 403)
+
+  const proxy = base()
+  proxy.headers['x-forwarded-for'] = '10.0.0.1'
+  const proxyRes = await status(proxy)
+  check('L3 带反向代理头 → 403', proxyRes.code, 403)
+
+  const remote = base()
+  remote.socket = { remoteAddress: '192.168.1.20' }
+  const remoteRes = await status(remote)
+  check('L4 非回环来源 → 403', remoteRes.code, 403)
+
+  const crossOrigin = base()
+  crossOrigin.headers.origin = 'https://evil.example.com'
+  const crossRes = await status(crossOrigin)
+  check('L5 跨源 Origin → 403', crossRes.code, 403)
+
+  const sameOrigin = base()
+  sameOrigin.headers.origin = 'http://127.0.0.1:12345'
+  const sameRes = await status(sameOrigin)
+  check('L6 同源 Origin 放行', sameRes.code, 200)
+
+  check('L7 门禁拒绝时带 forbidden 错误码', JSON.parse(noHeaderRes.body).error.code, 'forbidden')
+}
+
+// ── M. 排队消息也算忙（对齐宿主 hasDesktopActiveTasks）─────────────────
+{
+  const { tool, readState } = loadTool({
+    agents: {
+      list: () => [
+        { id: 'm-a', status: 'idle', inbox: { nextTurn: [{ id: 'x' }], nextStep: [] } },
+      ],
+    },
+    jobs: { list: () => [] },
+  })
+  const r = await tool.execute({ command: 'echo 1', countdownSec: 3 }, { agent: null })
+  check('M1 入口直接返回 counting', r.phase, 'counting')
+  await readState()
+  await sleep(等倒计时)
+  const s = await readState()
+  check('M2 有排队消息就判忙', s?.phase, 'blocked')
+  check('M3 blocker 是 queued', s?.blockers?.some((b) => b.kind === 'queued'), true)
+}
+
+// ── N. 已武装的定时提醒也算忙 ──────────────────────────────────────────
+{
+  const { tool, readState } = loadTool({
+    agents: { list: () => [{ id: 'n-a', status: 'idle', inbox: { nextTurn: [], nextStep: [] } }] },
+    jobs: { list: () => [] },
+    waterfallRows: (name, args) =>
+      name === 'workspace/session-activity' && args?.sessionId === 'n-a'
+        ? [{ kind: 'schedule', at: Date.now() + 60000 }]
+        : [],
+  })
+  const r = await tool.execute({ command: 'echo 1', countdownSec: 3 }, { agent: null })
+  check('N1 入口直接返回 counting', r.phase, 'counting')
+  await readState()
+  await sleep(等倒计时)
+  const s = await readState()
+  check('N2 有已武装的定时提醒就判忙', s?.phase, 'blocked')
+  check('N3 blocker 是 schedule', s?.blockers?.some((b) => b.kind === 'schedule'), true)
+}
+
+// ── O. 瀑布拿不到东西时不误判（宁可不拦，也别把重启永久卡死）──────────
+{
+  const { tool, readState } = loadTool({
+    agents: { list: () => [{ id: 'o-a', status: 'idle', inbox: { nextTurn: [], nextStep: [] } }] },
+    jobs: { list: () => [] },
+    waterfallRows: () => {
+      throw new Error('瀑布炸了')
+    },
+  })
+  const r = await tool.execute({ command: 'echo 1', countdownSec: 3 }, { agent: null })
+  check('O1 入口直接返回 counting', r.phase, 'counting')
+  await readState()
+  await sleep(等倒计时)
+  const s = await readState()
+  check('O2 瀑布抛错不算忙（继续往下走）', s?.phase, 'failed')
 }
 
 console.log([...PASS, ...FAIL].join('\n'))

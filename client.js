@@ -50,8 +50,20 @@ window.__ModuleLoader__.load({
     var POLL_ACTIVE_MS = 300
     var POLL_IDLE_MS = 2000
 
+    /**
+     * Host 的门禁要求每个请求都带这个头。
+     *
+     * 同源请求带自定义头不会触发预检，所以这行对正常轮询没有成本；它的作用是把
+     * 「别的网页用 fetch 打进来」这条路堵死 —— 跨源带自定义头必先预检，而宿主不放行 CORS。
+     */
+    var REQUEST_HEADER = 'x-auto-restart'
+
     function request(path, init) {
-      return fetch(API_PATH + path, init).then(function (res) {
+      var opts = init || {}
+      var headers = Object.assign({}, opts.headers || {})
+      headers[REQUEST_HEADER] = '1'
+      var merged = Object.assign({}, opts, { headers: headers })
+      return fetch(API_PATH + path, merged).then(function (res) {
         if (!res.ok) throw new Error('HTTP ' + res.status)
         return res.json()
       })
