@@ -1523,10 +1523,11 @@ export function apply(ctx, config = {}) {
   // ── 补投上一轮欠下的唤醒词 ───────────────────────────────────────────
   // 只在「上次是用 plugin 模式重启的」时候才有活干：只留一小段让路由先注册好，
   // 不用等服务就绪 —— deliverPendingWake 里每 250ms 会重试，服务晚到也能接上。
+  // 首检只等 200ms：新宿主起来时交接文件往往已经是 ready，早看一眼就少一秒。
   ctx.effect(() => {
     const timer = setTimeout(() => {
       void deliverPendingWake(getService, log)
-    }, 800)
+    }, 200)
     return () => clearTimeout(timer)
   }, `${name}: 补投唤醒词`)
 
