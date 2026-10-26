@@ -1,6 +1,6 @@
 {
   "meta": {
-    "title": "空闲重启",
-    "description": "确认整个 DSH 都空闲之后，才重启自己。"
+    "title": "自主重启",
+    "description": "由 agent 自己发起的重启：倒计时后确认整机空闲，再唤醒原会话。"
   }
 }

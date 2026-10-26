@@ -11,4 +11,4 @@
 
 - insert:
     - id: dsh-auto-restart
-      name: 'dsh-auto-restart'
+      name: 'dsh-autonomous-restart'

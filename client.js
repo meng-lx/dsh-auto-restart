@@ -23,7 +23,7 @@
 //   所以任何 pointerdown / wheel / keydown 一律取消，宁可多取消一次，
 //   也不要在有人正操作时把 DSH 杀掉。详见「取消」函数里的注释。
 
-var PKG = 'dsh-auto-restart'
+var PKG = 'dsh-autonomous-restart'
 
 window.__ModuleLoader__.load({
   id: PKG,

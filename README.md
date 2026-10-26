@@ -1,4 +1,4 @@
-# dsh-auto-restart
+# dsh-autonomous-restart
 
 当前版本 **1.2.2**
 
