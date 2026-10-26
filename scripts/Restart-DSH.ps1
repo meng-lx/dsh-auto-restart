@@ -51,9 +51,12 @@ param(
     [string]$WorkDir = '',
     [int]$GraceSec = 0,
     [int]$SettleSec = 8,
-    # 关窗口之后先等宿主自己退出多久（秒），等不到才强杀。
-    # 留给宿主把会话日志落盘 —— 直接 taskkill /F 会切断正在写的日志。
-    [int]$HostWaitSec = 8,
+    # 关窗口之后先等宿主自己退出多久（秒），等不到才强杀。默认 0 = 不等。
+    # 0 的理由：DSH 收到 WM_CLOSE 会先做 2 秒退出检查，判定后台有任务就弹确认框、
+    # 窗口不关；无人值守时那个框没人点，实测 8 秒空转后照样强杀。
+    #   2026-10-26 对照：等 8 秒 → 关闭耗 9 秒；不等 → 1 秒。
+    # 想在某台机器上试可以显式传 -HostWaitSec 8。
+    [int]$HostWaitSec = 0,
     [switch]$NoStart,
     [switch]$Detach,
     [switch]$DryRun,
@@ -654,12 +657,18 @@ if ([string]::IsNullOrWhiteSpace($Command)) {
         $psExe = [string](Get-Process -Id $PID).Path
         # 命令用 -EncodedCommand 传：Start-Process 的 ArgumentList 是按空格拼字符串的，
         # 直接把带引号/空格的命令塞进去会被重新分词。Base64(UTF-16LE) 没有转义问题。
-        $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($Command))
+        # 输出用 UTF-8（否则中文按控制台代码页变成问号）；progress 流静默（否则 stderr 会冒出 #< CLIXML 块）。
+        $wrapped = "[Console]::OutputEncoding = [Text.Encoding]::UTF8; $ProgressPreference = 'SilentlyContinue'; " + $Command
+        $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($wrapped))
         # 用独立进程跑命令：只有这样才能给等不动的命令设上限并按进程树杀掉。
         $proc = Start-Process -FilePath $psExe `
-            -ArgumentList @('-NoProfile', '-EncodedCommand', $encoded) `
+            -ArgumentList @('-NoProfile', '-NonInteractive', '-OutputFormat', 'Text', '-EncodedCommand', $encoded) `
             -WorkingDirectory $WorkDir -WindowStyle Hidden -PassThru `
             -RedirectStandardOutput $cmdOut -RedirectStandardError $cmdErr
+
+        # PS 5.1 的 -PassThru 对象在带重定向时没有绑定进程句柄，直接读 ExitCode 会拿到空值。
+        # 先摸一次 Handle 强制绑定，之后的 WaitForExit/ExitCode 才可靠。
+        try { $null = $proc.Handle } catch { }
 
         $finished = $proc.WaitForExit([Math]::Max(1, $CommandTimeoutSec) * 1000)
         if ($finished) {

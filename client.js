@@ -546,7 +546,7 @@ window.__ModuleLoader__.load({
           h(
             'div',
             { style: Object.assign({}, 说明, { marginTop: 10, fontSize: 12 }) },
-            当前.command ? '重启后执行：' + 当前.command : '',
+            当前.command ? '关闭后执行：' + 当前.command : '',
           ),
         ),
       )
