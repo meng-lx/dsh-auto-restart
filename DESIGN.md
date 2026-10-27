@@ -493,10 +493,12 @@ Host/Client 主文件放包根（`index.js` / `client.js`），只有启动计�
    已落盘到 `settings.json`（逐字段兜底，坏文件不报错）；
    另加只读的「现在在用」与「上一次运行结果」（`GET /last-run`）。
 5. ~~**命令超时**~~ —— ✅ 已完成（十五.9）。
-6. ~~**发布**~~ —— ✅ 已公开：https://github.com/meng-lx/dsh-auto-restart（public，master），
+6. ~~**发布**~~ —— ✅ 已公开：https://github.com/meng-lx/dsh-autonomous-restart（public，master），
    已向 awesome-dsh-plugin 提 PR（`#9003`）。仓库只进 README、SETUP、源码与脚本；
    `DESIGN.md`、`_probe/`、`test/` 由 `.gitignore` 排除。
    当时的 gate 只差「仓库满 1 天」这一条，24 小时后自动转绿。
+   **2026-10-28 仓库改名**：`dsh-auto-restart` → `dsh-autonomous-restart`，与 npm 包名、
+   市场条目名对齐（旧 URL 由 GitHub 永久重定向）。市场条目随之改名，PR `#9923`。
 7. **1.1 已合并回主目录**：`dsh-auto-restart-web` 里那份 `lib/launch-plan.js` 与两个
    重写的 `.ps1` 已替换主目录版本；`SETUP.md`、`install.ps1` 一并进入。
    （原 `HANDOFF.md` 的动机与踩坑已并入第十八节，文件本身已删除。）

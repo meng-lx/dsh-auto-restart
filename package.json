@@ -6,7 +6,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/meng-lx/dsh-auto-restart.git"
+    "url": "git+https://github.com/meng-lx/dsh-autonomous-restart.git"
   },
   "main": "./index.js",
   "exports": {
